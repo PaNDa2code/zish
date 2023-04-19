@@ -1,0 +1,33 @@
+#!/bin/bash
+
+display_output="eDP-1" # Change this to your display output
+
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 {-inc|-dec} <value>"
+    exit 1
+fi
+
+current_brightness=$(xrandr --verbose | grep -i -A 5 "^$display_output connected" | grep -i 'Brightness:' | cut -f2- -d:)
+change=$2
+change_percentage=$(echo "scale=2; $change / 100" | bc)
+
+case $1 in
+    -inc)
+        new_brightness=$(echo "$current_brightness + $change_percentage" | bc)
+        if (( $(echo "$new_brightness > 1" | bc -l) )); then
+            new_brightness=1
+        fi
+        ;;
+    -dec)
+        new_brightness=$(echo "$current_brightness - $change_percentage" | bc)
+        if (( $(echo "$new_brightness < 0" | bc -l) )); then
+            new_brightness=0
+        fi
+        ;;
+    *)
+        echo "Invalid option. Usage: $0 {-inc|-dec} <value>"
+        exit 1
+        ;;
+esac
+
+xrandr --output $display_output --brightness $new_brightness

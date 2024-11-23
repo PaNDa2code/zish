@@ -83,6 +83,7 @@ pub const Evaluator = struct {
         return self.executeExternal(args.items);
     }
 
+    // Evaluator executeExternal function
     fn executeExternal(self: *Self, args: []const []const u8) !ExitStatus {
         const child_pid = try std.os.fork();
         if (child_pid == 0) {
@@ -99,7 +100,8 @@ pub const Evaluator = struct {
         // Parent process
         const wait_result = try std.os.waitpid(child_pid, 0);
         return ExitStatus{
-            .code = @truncate(u8, wait_result.status >> 8),
+            // Fixed truncation syntax
+            .code = @as(u8, @truncate((wait_result.status >> 8))),
             .signal = if (std.os.system.WIFSIGNALED(wait_result.status))
                 std.os.system.WTERMSIG(wait_result.status)
             else

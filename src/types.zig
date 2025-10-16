@@ -3,7 +3,7 @@
 const std = @import("std");
 
 // compile-time security bounds
-pub const MAX_COMMAND_LENGTH = 4096;
+pub const MAX_COMMAND_LENGTH = 64 * 1024;
 pub const MAX_TOKEN_LENGTH = 1024;
 pub const MAX_HEREDOC_SIZE = 64 * 1024;
 pub const MAX_RECURSION_DEPTH = 32;

@@ -47,6 +47,8 @@ pub const Shell = struct {
     current_command_len: usize,
     original_termios: ?std.posix.termios = null,
     aliases: std.StringHashMap([]const u8),
+    variables: std.StringHashMap([]const u8),
+    last_exit_code: u8 = 0,
 
     const Self = @This();
 
@@ -70,6 +72,7 @@ pub const Shell = struct {
             .current_command_len = 0,
             .original_termios = null,
             .aliases = std.StringHashMap([]const u8).init(allocator),
+            .variables = std.StringHashMap([]const u8).init(allocator),
         };
 
         // set terminal to raw mode for proper input handling
@@ -608,6 +611,14 @@ pub const Shell = struct {
         }
         self.aliases.deinit();
 
+        // cleanup variables
+        var var_it = self.variables.iterator();
+        while (var_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.variables.deinit();
+
         if (self.hist) |h| h.deinit();
         self.allocator.free(self.current_command);
         self.allocator.destroy(self);
@@ -727,7 +738,9 @@ pub const Shell = struct {
         defer if (!std.mem.eql(u8, resolved_command, command)) self.allocator.free(resolved_command);
 
 
-        return try self.executeCommandInternal(resolved_command);
+        const exit_code = try self.executeCommandInternal(resolved_command);
+        self.last_exit_code = exit_code;
+        return exit_code;
     }
 
     fn resolveAlias(self: *Self, command: []const u8) []const u8 {
@@ -751,28 +764,236 @@ pub const Shell = struct {
         return command;
     }
 
+    fn expandVariables(self: *Self, input: []const u8) ![]const u8 {
+        // Simple variable expansion - replace $VAR with variable value
+        var result = try std.ArrayList(u8).initCapacity(self.allocator, input.len);
+        defer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < input.len) {
+            if (input[i] == '$' and i + 1 < input.len) {
+                // Found variable expansion
+                i += 1; // skip $
+
+                // Handle special single-character variables first
+                if (i < input.len and input[i] == '?') {
+                    var exit_code_buf: [8]u8 = undefined;
+                    const exit_code_str = std.fmt.bufPrint(&exit_code_buf, "{d}", .{self.last_exit_code}) catch "0";
+                    try result.appendSlice(self.allocator, exit_code_str);
+                    i += 1; // consume the ?
+                    continue;
+                }
+
+                // Handle command substitution $(command)
+                if (i < input.len and input[i] == '(') {
+                    i += 1; // skip (
+                    const cmd_start = i;
+
+                    // Find matching closing paren
+                    var paren_count: u32 = 1;
+                    while (i < input.len and paren_count > 0) {
+                        switch (input[i]) {
+                            '(' => paren_count += 1,
+                            ')' => paren_count -= 1,
+                            else => {},
+                        }
+                        if (paren_count > 0) i += 1;
+                    }
+
+                    if (paren_count == 0) {
+                        const command = input[cmd_start..i];
+                        i += 1; // consume )
+
+                        // Execute command and capture output
+                        const cmd_output = self.executeCommandAndCapture(command) catch "";
+                        try result.appendSlice(self.allocator, std.mem.trimRight(u8, cmd_output, "\n\r"));
+                        continue;
+                    } else {
+                        // Unmatched parens, treat as regular text
+                        try result.append(self.allocator, '$');
+                        try result.append(self.allocator, '(');
+                        i = cmd_start;
+                        continue;
+                    }
+                }
+
+                const name_start = i;
+                // Find end of variable name (alphanumeric + underscore)
+                while (i < input.len and (std.ascii.isAlphanumeric(input[i]) or input[i] == '_')) {
+                    i += 1;
+                }
+
+                if (i > name_start) {
+                    const var_name = input[name_start..i];
+
+                    // Look up variable
+                    if (self.variables.get(var_name)) |value| {
+                        try result.appendSlice(self.allocator, value);
+                    } else {
+                        // Try environment variable
+                        const env_value = std.process.getEnvVarOwned(self.allocator, var_name) catch null;
+                        if (env_value) |val| {
+                            defer self.allocator.free(val);
+                            try result.appendSlice(self.allocator, val);
+                        }
+                        // If no variable found, don't expand (leave empty)
+                    }
+                } else {
+                    // Just a lone $, keep it
+                    try result.append(self.allocator, '$');
+                }
+            } else if (input[i] == '`') {
+                // Handle backtick command substitution
+                i += 1; // skip `
+                const cmd_start = i;
+
+                // Find matching closing backtick
+                while (i < input.len and input[i] != '`') {
+                    i += 1;
+                }
+
+                if (i < input.len) {
+                    const command = input[cmd_start..i];
+                    i += 1; // consume closing `
+
+                    // Execute command and capture output
+                    const cmd_output = self.executeCommandAndCapture(command) catch "";
+                    try result.appendSlice(self.allocator, std.mem.trimRight(u8, cmd_output, "\n\r"));
+                } else {
+                    // Unmatched backtick, treat as regular text
+                    try result.append(self.allocator, '`');
+                    i = cmd_start;
+                }
+            } else {
+                try result.append(self.allocator, input[i]);
+                i += 1;
+            }
+        }
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn executeCommandAndCapture(self: *Self, command: []const u8) ![]const u8 {
+        // Execute a command and capture its output
+        // For now, implement simple built-in commands
+
+        const trimmed_cmd = std.mem.trim(u8, command, " \t\n\r");
+
+        if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
+            var buf: [4096]u8 = undefined;
+            const cwd = std.posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
+            return self.allocator.dupe(u8, cwd);
+        } else if (std.mem.eql(u8, trimmed_cmd, "date")) {
+            // Simple date implementation - just return a placeholder
+            return self.allocator.dupe(u8, "Wed Oct 16 10:00:00 UTC 2025");
+        } else if (std.mem.startsWith(u8, trimmed_cmd, "echo ")) {
+            const msg = trimmed_cmd[5..];
+            return self.allocator.dupe(u8, msg);
+        } else {
+            // For other commands, try to execute them externally and capture output
+            return self.executeExternalAndCapture(trimmed_cmd) catch self.allocator.dupe(u8, "");
+        }
+    }
+
+    fn executeExternalAndCapture(self: *Self, command: []const u8) ![]const u8 {
+        // Execute external command and capture output
+        const result = try std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{ "/bin/sh", "-c", command },
+            .max_output_bytes = 4096,
+        });
+        defer self.allocator.free(result.stderr);
+
+        return result.stdout; // caller owns this memory
+    }
+
     fn executeCommandInternal(self: *Self, command: []const u8) !u8 {
+
+        // Expand variables in command first (but not for assignments)
+        var expanded_command: []const u8 = command;
+        var should_free_expanded = false;
+
+        // Don't expand variables in assignment statements
+        if (std.mem.indexOfScalar(u8, command, '=')) |eq_pos| {
+            const prefix = command[0..eq_pos];
+            if (std.mem.indexOfScalar(u8, prefix, ' ') == null) {
+                // This is an assignment, don't expand variables
+            } else {
+                // This has = but isn't an assignment, expand variables
+                expanded_command = try self.expandVariables(command);
+                should_free_expanded = true;
+            }
+        } else {
+            // No = sign, expand variables
+            expanded_command = try self.expandVariables(command);
+            should_free_expanded = true;
+        }
+
+        defer if (should_free_expanded) self.allocator.free(expanded_command);
+
+        // handle variable assignments (VAR=value)
+        if (std.mem.indexOfScalar(u8, command, '=')) |eq_pos| {
+            // Check if this looks like an assignment (no spaces before =)
+            const prefix = command[0..eq_pos];
+            if (std.mem.indexOfScalar(u8, prefix, ' ') == null) {
+                // This is a variable assignment
+                const name = prefix;
+                const value = command[eq_pos + 1..];
+
+                // Simple validation - variable name should only contain alphanumeric and underscore
+                for (name) |c| {
+                    if (!std.ascii.isAlphanumeric(c) and c != '_') {
+                        break; // Not a valid variable name, treat as command
+                    }
+                } else {
+                    // Valid variable name - store in shell variables (for now)
+                    const name_copy = self.allocator.dupe(u8, name) catch {
+                        std.debug.print("zish: assignment failed: out of memory\n", .{});
+                        return 1;
+                    };
+                    const value_copy = self.allocator.dupe(u8, value) catch {
+                        self.allocator.free(name_copy);
+                        std.debug.print("zish: assignment failed: out of memory\n", .{});
+                        return 1;
+                    };
+
+                    // Free existing value if it exists
+                    if (self.variables.get(name_copy)) |old_value| {
+                        self.allocator.free(old_value);
+                    }
+
+                    self.variables.put(name_copy, value_copy) catch {
+                        self.allocator.free(name_copy);
+                        self.allocator.free(value_copy);
+                        std.debug.print("zish: assignment failed: out of memory\n", .{});
+                        return 1;
+                    };
+                    return 0;
+                }
+            }
+        }
+
         // handle builtins
-        if (std.mem.eql(u8, command, "exit")) {
+        if (std.mem.eql(u8, expanded_command, "exit")) {
             self.running = false;
             return 0;
         }
 
-        if (std.mem.startsWith(u8, command, "echo ")) {
-            const msg = command[5..];
+        if (std.mem.startsWith(u8, expanded_command, "echo ")) {
+            const msg = expanded_command[5..];
             std.debug.print("{s}\n", .{msg});
             return 0;
         }
 
-        if (std.mem.eql(u8, command, "pwd")) {
+        if (std.mem.eql(u8, expanded_command, "pwd")) {
             var buf: [4096]u8 = undefined;
             const cwd = try std.posix.getcwd(&buf);
             std.debug.print("{s}\n", .{cwd});
             return 0;
         }
 
-        if (std.mem.startsWith(u8, command, "cd ")) {
-            var path = std.mem.trim(u8, command[3..], " ");
+        if (std.mem.startsWith(u8, expanded_command, "cd ")) {
+            var path = std.mem.trim(u8, expanded_command[3..], " ");
 
             // expand tilde to home directory
             var expanded_path_buf: [4096]u8 = undefined;
@@ -842,7 +1063,7 @@ pub const Shell = struct {
         }
 
         // try to execute external command
-        return try self.executeExternal(command);
+        return try self.executeExternal(expanded_command);
     }
 
     fn executeExternal(self: *Self, command: []const u8) !u8 {

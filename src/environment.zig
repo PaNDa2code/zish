@@ -1,27 +1,27 @@
-// secure_env.zig - capability-based environment with memory safety
+// environment.zig - environment variable management with memory safety
 
 const std = @import("std");
-const secure = @import("secure_types.zig");
+const types = @import("types.zig");
 
-// capability-based environment system
-pub const securenvironment = struct {
+// environment variable management system
+pub const Environment = struct {
     arena: std.heap.arenaallocator,
-    capabilities: std.enumset(secure.environmentcapability),
-    variables: std.hashmap(secure.internedstring, []const u8, stringcontext, 80),
+    capabilities: std.enumset(types.EnvironmentCapability),
+    variables: std.hashmap(types.InternedString, []const u8, stringcontext, 80),
     current_dir: []const u8,
     exit_status: i32,
 
     const self = @this();
     const stringcontext = struct {
-        pub fn hash(_: @this(), s: secure.internedstring) u64 {
+        pub fn hash(_: @this(), s: types.InternedString) u64 {
             return std.hash_map.hashstring(s.data);
         }
-        pub fn eql(_: @this(), a: secure.internedstring, b: secure.internedstring) bool {
+        pub fn eql(_: @this(), a: types.InternedString, b: types.InternedString) bool {
             return a.eql(b);
         }
     };
 
-    pub fn init(parent_allocator: std.mem.allocator, caps: std.enumset(secure.environmentcapability)) !*self {
+    pub fn init(parent_allocator: std.mem.allocator, caps: std.enumset(types.EnvironmentCapability)) !*self {
         var arena = std.heap.arenaallocator.init(parent_allocator);
         const allocator = arena.allocator();
 
@@ -29,7 +29,7 @@ pub const securenvironment = struct {
         env.* = .{
             .arena = arena,
             .capabilities = caps,
-            .variables = std.hashmap(secure.internedstring, []const u8, stringcontext, 80).init(allocator),
+            .variables = std.hashmap(types.InternedString, []const u8, stringcontext, 80).init(allocator),
             .current_dir = try std.fs.cwd().realpathallocarena(allocator, "."),
             .exit_status = 0,
         };
@@ -45,15 +45,15 @@ pub const securenvironment = struct {
     }
 
     pub fn get(self: *self, name: []const u8) ?[]const u8 {
-        const interned = secure.internedstring{ .data = name };
+        const interned = types.InternedString{ .data = name };
         return self.variables.get(interned);
     }
 
     pub fn set(self: *self, name: []const u8, value: []const u8) !void {
-        try secure.validateshellsafe(name);
-        try secure.validateshellsafe(value);
+        try types.validateShellSafe(name);
+        try types.validateShellSafe(value);
 
-        if (value.len > secure.max_env_value_length) {
+        if (value.len > types.MAX_ENV_VALUE_LENGTH) {
             return error.environmentvaluetoolong;
         }
 
@@ -61,14 +61,14 @@ pub const securenvironment = struct {
         const name_copy = try allocator.dupe(u8, name);
         const value_copy = try allocator.dupe(u8, value);
 
-        const interned_name = secure.internedstring{ .data = name_copy };
+        const interned_name = types.InternedString{ .data = name_copy };
 
         // arena-based allocation means no need to free old values
         try self.variables.put(interned_name, value_copy);
     }
 
     pub fn unset(self: *self, name: []const u8) bool {
-        const interned = secure.internedstring{ .data = name };
+        const interned = types.InternedString{ .data = name };
         return self.variables.remove(interned);
     }
 
@@ -77,7 +77,7 @@ pub const securenvironment = struct {
     }
 
     pub fn setcurrentdir(self: *self, path: []const u8) !void {
-        try secure.validateshellsafe(path);
+        try types.validateShellSafe(path);
 
         const allocator = self.arena.allocator();
         const new_path = std.fs.cwd().realpathallocarena(allocator, path) catch |err| {
@@ -140,7 +140,7 @@ pub const securenvironment = struct {
 
     fn sanitizeenvvalue(self: *self, value: []const u8) ![]const u8 {
         // length limit
-        if (value.len > secure.max_env_value_length) {
+        if (value.len > types.MAX_ENV_VALUE_LENGTH) {
             return error.environmentvaluetoolong;
         }
 
@@ -224,7 +224,7 @@ pub const securenvironment = struct {
 // compile-time security invariants
 comptime {
     // ensure environment cannot be used to bypass security
-    if (@sizeof(secure.internedstring) > 16) {
+    if (@sizeof(types.InternedString) > 16) {
         @compileerror("interned strings too large - potential dos vector");
     }
 }

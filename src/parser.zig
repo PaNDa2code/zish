@@ -1,4 +1,4 @@
-// secure_parser.zig - typestate parser with bounds checking
+// parser.zig - typestate parser with bounds checking
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -21,25 +21,25 @@ pub const parsererror = error{
     parserfinished,
     invalidparserstate,
     outofmemory,
-} || secure.securityerror;
+} || types.SecurityError;
 
 // typestate-based parser
-pub const secureparser = struct {
-    lexer: lexer.securelexer,
-    builder: ast.astbuilder,
+pub const Parser = struct {
+    lexer: lexer.Lexer,
+    builder: ast.AstBuilder,
     state: parserstate,
     current_token: lexer.token,
     peek_token: lexer.token,
-    recursion_depth: secure.recursiondepth,
+    recursion_depth: types.RecursionDepth,
 
     const self = @this();
 
     pub fn init(input: []const u8, allocator: std.mem.allocator) !self {
-        var lex = try lexer.securelexer.init(input);
+        var lex = try lexer.Lexer.init(input);
 
         return self{
             .lexer = lex,
-            .builder = ast.astbuilder.init(allocator),
+            .builder = ast.AstBuilder.init(allocator),
             .state = .initial,
             .current_token = lexer.token.empty,
             .peek_token = lexer.token.empty,
@@ -69,7 +69,7 @@ pub const secureparser = struct {
     }
 
     // main parsing entry point with security checks
-    pub fn parse(self: *self) !*const ast.astnode {
+    pub fn parse(self: *self) !*const ast.AstNode {
         // prime the parser
         try self.nexttoken();
 
@@ -83,10 +83,10 @@ pub const secureparser = struct {
         return root;
     }
 
-    fn parsecommandlist(self: *self) parsererror!*const ast.astnode {
+    fn parsecommandlist(self: *self) parsererror!*const ast.AstNode {
         if (self.state != .hasboth) return error.invalidparserstate;
 
-        var commands = std.arraylist(*const ast.astnode).init(self.builder.arena.allocator());
+        var commands = std.arraylist(*const ast.AstNode).init(self.builder.arena.allocator());
 
         while (self.current_token.ty != .eof) {
             // skip empty statements
@@ -96,11 +96,11 @@ pub const secureparser = struct {
             }
 
             // prevent dos via massive command lists
-            if (commands.items.len >= secure.max_args_count) {
+            if (commands.items.len >= types.MAX_ARGS_COUNT) {
                 return error.toomanycommands;
             }
 
-            const cmd = try self.parsecommand();
+            const cmd = try self.parsepipeline();
             try commands.append(cmd);
 
             // handle separators
@@ -124,13 +124,45 @@ pub const secureparser = struct {
         );
     }
 
-    fn parsecommand(self: *self) parsererror!*const ast.astnode {
+    fn parsepipeline(self: *self) parsererror!*const ast.AstNode {
+        var pipeline_commands = std.arraylist(*const ast.AstNode).init(self.builder.arena.allocator());
+
+        // Parse first command
+        const first_cmd = try self.parsecommand();
+        try pipeline_commands.append(first_cmd);
+
+        // Parse additional commands connected by pipes
+        while (self.current_token.ty == .Pipe) {
+            try self.nexttoken(); // consume pipe token
+
+            if (pipeline_commands.items.len >= types.MAX_ARGS_COUNT) {
+                return error.toomanypipelinecommands;
+            }
+
+            const next_cmd = try self.parsecommand();
+            try pipeline_commands.append(next_cmd);
+        }
+
+        // If we only have one command, return it directly
+        if (pipeline_commands.items.len == 1) {
+            return pipeline_commands.items[0];
+        }
+
+        // Create pipeline node
+        return self.builder.createpipeline(
+            pipeline_commands.items,
+            pipeline_commands.items[0].line,
+            pipeline_commands.items[0].column,
+        );
+    }
+
+    fn parsecommand(self: *self) parsererror!*const ast.AstNode {
         // recursion depth check
-        if (self.recursion_depth >= secure.max_recursion_depth) {
+        if (self.recursion_depth >= types.MAX_RECURSION_DEPTH) {
             return error.recursionlimitexceeded;
         }
 
-        self.recursion_depth = try secure.checkedadd(secure.recursiondepth, self.recursion_depth, 1);
+        self.recursion_depth = try types.checkedAdd(types.RecursionDepth, self.recursion_depth, 1);
         defer self.recursion_depth -= 1;
 
         return switch (self.current_token.ty) {
@@ -145,12 +177,30 @@ pub const secureparser = struct {
         };
     }
 
-    fn parsesimplecommand(self: *self) parsererror!*const ast.astnode {
-        var words = std.arraylist(*const ast.astnode).init(self.builder.arena.allocator());
+    fn parsesimplecommand(self: *self) parsererror!*const ast.AstNode {
+        var words = std.arraylist(*const ast.AstNode).init(self.builder.arena.allocator());
 
         while (self.current_token.ty != .eof) {
             switch (self.current_token.ty) {
-                .word, .string, .integer => {
+                .word => {
+                    // Check if this word is an assignment (contains =)
+                    if (std.mem.indexOfScalar(u8, self.current_token.value, '=')) |eq_pos| {
+                        // This is an assignment like VAR=value
+                        const token = self.current_token;
+                        try self.nexttoken();
+
+                        const name = token.value[0..eq_pos];
+                        const value = token.value[eq_pos + 1..];
+
+                        // Create assignment node
+                        return self.builder.createassignment(name, value, token.line, token.column);
+                    } else {
+                        // Regular word
+                        const word = try self.parseword();
+                        try words.append(word);
+                    }
+                },
+                .string, .integer => {
                     const word = try self.parseword();
                     try words.append(word);
                 },
@@ -169,13 +219,13 @@ pub const secureparser = struct {
         );
     }
 
-    fn parseword(self: *self) parsererror!*const ast.astnode {
+    fn parseword(self: *self) parsererror!*const ast.AstNode {
         if (self.state != .hasboth) return error.invalidparserstate;
 
         const token = self.current_token;
         try self.nexttoken();
 
-        const node_type: ast.nodetype = switch (token.ty) {
+        const node_type: ast.NodeType = switch (token.ty) {
             .word => .word,
             .string => .string,
             .integer => .number,
@@ -185,13 +235,13 @@ pub const secureparser = struct {
         return switch (node_type) {
             .word => self.builder.createword(token.value, token.line, token.column),
             .string => self.builder.createstring(token.value, token.line, token.column),
-            .number => self.builder.createnode(.number, token.value, &[_]*const ast.astnode{}, token.line, token.column),
+            .number => self.builder.createnode(.number, token.value, &[_]*const ast.AstNode{}, token.line, token.column),
             else => error.invalidsyntax,
         };
     }
 
     // control structure parsing with bounds checking
-    fn parseif(self: *self) parsererror!*const ast.astnode {
+    fn parseif(self: *self) parsererror!*const ast.AstNode {
         const if_token = self.current_token;
         try self.nexttoken(); // consume 'if'
 
@@ -207,7 +257,7 @@ pub const secureparser = struct {
         // parse then branch
         const then_branch = try self.parsecommandlist();
 
-        var else_branch: ?*const ast.astnode = null;
+        var else_branch: ?*const ast.AstNode = null;
 
         // handle else clause
         if (self.current_token.ty == .else) {
@@ -230,7 +280,7 @@ pub const secureparser = struct {
         );
     }
 
-    fn parsewhile(self: *self) parsererror!*const ast.astnode {
+    fn parsewhile(self: *self) parsererror!*const ast.AstNode {
         const while_token = self.current_token;
         try self.nexttoken(); // consume 'while'
 
@@ -256,7 +306,7 @@ pub const secureparser = struct {
         );
     }
 
-    fn parseuntil(self: *self) parsererror!*const ast.astnode {
+    fn parseuntil(self: *self) parsererror!*const ast.AstNode {
         const until_token = self.current_token;
         try self.nexttoken(); // consume 'until'
 
@@ -282,7 +332,7 @@ pub const secureparser = struct {
         );
     }
 
-    fn parsefor(self: *self) parsererror!*const ast.astnode {
+    fn parsefor(self: *self) parsererror!*const ast.AstNode {
         const for_token = self.current_token;
         try self.nexttoken(); // consume 'for'
 
@@ -295,13 +345,13 @@ pub const secureparser = struct {
         try self.nexttoken(); // consume 'in'
 
         // parse value list
-        var values = std.arraylist(*const ast.astnode).init(self.builder.arena.allocator());
+        var values = std.arraylist(*const ast.AstNode).init(self.builder.arena.allocator());
         while (self.current_token.ty != .semicolon and
             self.current_token.ty != .newline and
             self.current_token.ty != .do and
             self.current_token.ty != .eof)
         {
-            if (values.items.len >= secure.max_args_count) {
+            if (values.items.len >= types.MAX_ARGS_COUNT) {
                 return error.toomanyarguments;
             }
 
@@ -335,7 +385,7 @@ pub const secureparser = struct {
         );
     }
 
-    fn parsecase(self: *self) parsererror!*const ast.astnode {
+    fn parsecase(self: *self) parsererror!*const ast.AstNode {
         // simplified case parsing - full implementation would be more complex
         const case_token = self.current_token;
         try self.nexttoken(); // consume 'case'
@@ -360,13 +410,13 @@ pub const secureparser = struct {
         return self.builder.createnode(
             .case_statement,
             "",
-            &[_]*const ast.astnode{expr},
+            &[_]*const ast.AstNode{expr},
             case_token.line,
             case_token.column,
         );
     }
 
-    fn parsegroup(self: *self) parsererror!*const ast.astnode {
+    fn parsegroup(self: *self) parsererror!*const ast.AstNode {
         const brace_token = self.current_token;
         try self.nexttoken(); // consume '{'
 
@@ -380,13 +430,13 @@ pub const secureparser = struct {
         return self.builder.createnode(
             .list,
             "",
-            &[_]*const ast.astnode{body},
+            &[_]*const ast.AstNode{body},
             brace_token.line,
             brace_token.column,
         );
     }
 
-    fn parsesubshell(self: *self) parsererror!*const ast.astnode {
+    fn parsesubshell(self: *self) parsererror!*const ast.AstNode {
         const paren_token = self.current_token;
         try self.nexttoken(); // consume '('
 
@@ -400,7 +450,7 @@ pub const secureparser = struct {
         return self.builder.createnode(
             .subshell,
             "",
-            &[_]*const ast.astnode{body},
+            &[_]*const ast.AstNode{body},
             paren_token.line,
             paren_token.column,
         );
@@ -410,7 +460,7 @@ pub const secureparser = struct {
 // compile-time security checks
 comptime {
     // ensure parser cannot be used for dos
-    if (@sizeof(secureparser) > 1024) {
+    if (@sizeof(Parser) > 1024) {
         @compileerror("parser too large - potential memory exhaustion");
     }
 }

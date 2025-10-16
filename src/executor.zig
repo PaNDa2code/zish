@@ -1,4 +1,4 @@
-// secure_executor.zig - capability-based sandboxed execution
+// executor.zig - command execution engine
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -13,10 +13,9 @@ pub const exitstatus = struct {
 };
 
 // sandboxed executor with capability restrictions
-pub const secureexecutor = struct {
+pub const Executor = struct {
     arena: std.heap.arenaallocator,
-    environment: *env.securenvironment,
-    execution_caps: std.enumset(secure.executioncapability),
+    environment: *env.Environment,
     command_whitelist: []const []const u8,
     max_execution_time: u64, // nanoseconds
 
@@ -25,8 +24,7 @@ pub const secureexecutor = struct {
 
     pub fn init(
         allocator: std.mem.allocator,
-        environment: *env.securenvironment,
-        execution_caps: std.enumset(secure.executioncapability),
+        environment: *env.Environment,
     ) !*self {
         var arena = std.heap.arenaallocator.init(allocator);
 
@@ -34,7 +32,6 @@ pub const secureexecutor = struct {
         executor.* = .{
             .arena = arena,
             .environment = environment,
-            .execution_caps = execution_caps,
             .command_whitelist = &default_safe_commands,
             .max_execution_time = max_execution_time_default,
         };
@@ -47,10 +44,12 @@ pub const secureexecutor = struct {
     }
 
     // main evaluation entry point with security checks
-    pub fn evaluate(self: *self, node: *const ast.astnode) !exitstatus {
+    pub fn evaluate(self: *self, node: *const ast.AstNode) !exitstatus {
         return switch (node.node_type) {
             .command => self.evaluatecommand(node),
             .list => self.evaluatelist(node),
+            .assignment => self.evaluateassignment(node),
+            .pipeline => self.evaluatepipeline(node),
             .if_statement => self.evaluateif(node),
             .while_loop => self.evaluatewhile(node),
             .until_loop => self.evaluateuntil(node),
@@ -60,24 +59,20 @@ pub const secureexecutor = struct {
         };
     }
 
-    fn evaluatecommand(self: *self, node: *const ast.astnode) !exitstatus {
+    fn evaluatecommand(self: *self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len == 0) return error.emptycommand;
 
         const cmd_name = node.children[0].value;
 
         // security: validate command name
-        try secure.validateshellsafe(cmd_name);
+        try types.validateShellSafe(cmd_name);
 
         // check if it's a builtin command
         if (self.isbuiltin(cmd_name)) {
             return self.executebuiltin(cmd_name, node.children[1..]);
         }
 
-        // check capability for external execution
-        if (!self.execution_caps.contains(.processspawn)) {
-            std.debug.print("command execution not allowed: insufficient capability\n", .{});
-            return exitstatus{ .code = 126, .signal = null, .terminated_by_policy = true };
-        }
+        // external execution allowed
 
         // whitelist check for external commands
         if (!self.iscommandallowed(cmd_name)) {
@@ -90,7 +85,7 @@ pub const secureexecutor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn evaluatelist(self: *self, node: *const ast.astnode) !exitstatus {
+    fn evaluatelist(self: *self, node: *const ast.AstNode) !exitstatus {
         var last_status = exitstatus{ .code = 0, .signal = null };
 
         for (node.children) |child| {
@@ -104,7 +99,7 @@ pub const secureexecutor = struct {
         return last_status;
     }
 
-    fn evaluateif(self: *self, node: *const ast.astnode) !exitstatus {
+    fn evaluateif(self: *self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len < 2) return error.invalidsyntax;
 
         // evaluate condition
@@ -121,7 +116,7 @@ pub const secureexecutor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn evaluatewhile(self: *self, node: *const ast.astnode) !exitstatus {
+    fn evaluatewhile(self: *self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len != 2) return error.invalidsyntax;
 
         var last_status = exitstatus{ .code = 0, .signal = null };
@@ -138,7 +133,7 @@ pub const secureexecutor = struct {
 
             if (last_status.terminated_by_policy) break;
 
-            iterations = try secure.checkedadd(u32, iterations, 1);
+            iterations = try types.checkedAdd(u32, iterations, 1);
         }
 
         if (iterations >= max_iterations) {
@@ -149,7 +144,7 @@ pub const secureexecutor = struct {
         return last_status;
     }
 
-    fn evaluateuntil(self: *self, node: *const ast.astnode) !exitstatus {
+    fn evaluateuntil(self: *self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len != 2) return error.invalidsyntax;
 
         var last_status = exitstatus{ .code = 0, .signal = null };
@@ -166,7 +161,7 @@ pub const secureexecutor = struct {
 
             if (last_status.terminated_by_policy) break;
 
-            iterations = try secure.checkedadd(u32, iterations, 1);
+            iterations = try types.checkedAdd(u32, iterations, 1);
         }
 
         if (iterations >= max_iterations) {
@@ -177,7 +172,7 @@ pub const secureexecutor = struct {
         return last_status;
     }
 
-    fn evaluatefor(self: *self, node: *const ast.astnode) !exitstatus {
+    fn evaluatefor(self: *self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len < 3) return error.invalidsyntax;
 
         const variable = node.children[0];
@@ -187,7 +182,7 @@ pub const secureexecutor = struct {
         var last_status = exitstatus{ .code = 0, .signal = null };
 
         // iteration limit for security
-        if (values.len > secure.max_args_count) {
+        if (values.len > types.MAX_ARGS_COUNT) {
             return exitstatus{ .code = 1, .signal = null, .terminated_by_policy = true };
         }
 
@@ -204,10 +199,37 @@ pub const secureexecutor = struct {
         return last_status;
     }
 
-    fn evaluatesubshell(self: *self, node: *const ast.astnode) !exitstatus {
+    fn evaluatesubshell(self: *self, node: *const ast.AstNode) !exitstatus {
         // subshells would normally fork - for now just evaluate in current context
         if (node.children.len == 0) return error.emptysubshell;
         return self.evaluate(node.children[0]);
+    }
+
+    fn evaluateassignment(self: *self, node: *const ast.AstNode) !exitstatus {
+        if (node.children.len != 2) return error.invalidsyntax;
+
+        const name_node = node.children[0];
+        const value_node = node.children[1];
+
+        // Set the variable in the environment
+        try self.environment.set(name_node.value, value_node.value);
+
+        return exitstatus{ .code = 0, .signal = null };
+    }
+
+    fn evaluatepipeline(self: *self, node: *const ast.AstNode) !exitstatus {
+        // TODO: Implement proper pipeline with pipes
+        // For now, just execute commands sequentially (this is wrong!)
+        var last_status = exitstatus{ .code = 0, .signal = null };
+
+        for (node.children) |child| {
+            last_status = try self.evaluate(child);
+
+            // In a real pipeline, we'd break on failure, but let's continue for now
+            if (last_status.terminated_by_policy) break;
+        }
+
+        return last_status;
     }
 
     // builtin command implementations with security focus
@@ -223,7 +245,7 @@ pub const secureexecutor = struct {
         return false;
     }
 
-    fn executebuiltin(self: *self, cmd_name: []const u8, args: []const *const ast.astnode) !exitstatus {
+    fn executebuiltin(self: *self, cmd_name: []const u8, args: []const *const ast.AstNode) !exitstatus {
         if (std.mem.eql(u8, cmd_name, "echo")) {
             return self.builtinecho(args);
         } else if (std.mem.eql(u8, cmd_name, "pwd")) {
@@ -245,14 +267,14 @@ pub const secureexecutor = struct {
         return error.unknownbuiltin;
     }
 
-    fn builtinecho(self: *self, args: []const *const ast.astnode) !exitstatus {
+    fn builtinecho(self: *self, args: []const *const ast.AstNode) !exitstatus {
         _ = self;
 
         for (args, 0..) |arg, i| {
             if (i > 0) std.debug.print(" ", .{});
 
             // security: validate output
-            try secure.validateshellsafe(arg.value);
+            try types.validateShellSafe(arg.value);
             std.debug.print("{s}", .{arg.value});
         }
         std.debug.print("\n", .{});
@@ -260,13 +282,13 @@ pub const secureexecutor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtinpwd(self: *self, args: []const *const ast.astnode) !exitstatus {
+    fn builtinpwd(self: *self, args: []const *const ast.AstNode) !exitstatus {
         _ = args;
         std.debug.print("{s}\n", .{self.environment.getcurrentdir()});
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtincd(self: *self, args: []const *const ast.astnode) !exitstatus {
+    fn builtincd(self: *self, args: []const *const ast.AstNode) !exitstatus {
         const target_path = if (args.len > 0)
             args[0].value
         else
@@ -280,7 +302,7 @@ pub const secureexecutor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtinexit(self: *self, args: []const *const ast.astnode) !exitstatus {
+    fn builtinexit(self: *self, args: []const *const ast.AstNode) !exitstatus {
         _ = self;
 
         const exit_code: u8 = if (args.len > 0 and args[0].value.len > 0) blk: {
@@ -290,19 +312,19 @@ pub const secureexecutor = struct {
         std.process.exit(exit_code);
     }
 
-    fn builtinexport(self: *self, args: []const *const ast.astnode) !exitstatus {
+    fn builtinexport(self: *self, args: []const *const ast.AstNode) !exitstatus {
         for (args) |arg| {
             const var_assignment = arg.value;
 
             // security: validate assignment
-            try secure.validateshellsafe(var_assignment);
+            try types.validateShellSafe(var_assignment);
 
             if (std.mem.indexofscalar(u8, var_assignment, '=')) |eq_pos| {
                 const name = var_assignment[0..eq_pos];
                 const value = var_assignment[eq_pos + 1..];
 
                 // additional validation for exported variables
-                if (name.len == 0 or value.len > secure.max_env_value_length) {
+                if (name.len == 0 or value.len > types.MAX_ENV_VALUE_LENGTH) {
                     return exitstatus{ .code = 1, .signal = null };
                 }
 
@@ -316,9 +338,9 @@ pub const secureexecutor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtinunset(self: *self, args: []const *const ast.astnode) !exitstatus {
+    fn builtinunset(self: *self, args: []const *const ast.AstNode) !exitstatus {
         for (args) |arg| {
-            try secure.validateshellsafe(arg.value);
+            try types.validateShellSafe(arg.value);
             _ = self.environment.unset(arg.value);
         }
         return exitstatus{ .code = 0, .signal = null };

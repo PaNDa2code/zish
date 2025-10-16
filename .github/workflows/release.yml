@@ -1,0 +1,32 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: setup zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      
+      - name: build x86_64-linux
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux
+      
+      - name: package
+        run: |
+          cd zig-out/bin
+          tar czf ../../${{ github.event.repository.name }}-x86_64-linux.tar.gz *
+      
+      - name: release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ github.event.repository.name }}-x86_64-linux.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

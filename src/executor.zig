@@ -19,16 +19,16 @@ pub const Executor = struct {
     command_whitelist: []const []const u8,
     max_execution_time: u64, // nanoseconds
 
-    const self = @this();
+    const Self = @This();
     const max_execution_time_default = 30 * std.time.ns_per_s; // 30 seconds
 
     pub fn init(
         allocator: std.mem.allocator,
         environment: *env.Environment,
-    ) !*self {
+    ) !*Self {
         var arena = std.heap.arenaallocator.init(allocator);
 
-        const executor = try arena.allocator().create(self);
+        const executor = try arena.allocator().create(Self);
         executor.* = .{
             .arena = arena,
             .environment = environment,
@@ -39,12 +39,12 @@ pub const Executor = struct {
         return executor;
     }
 
-    pub fn deinit(self: *self) void {
+    pub fn deinit(self: *Self) void {
         self.arena.deinit();
     }
 
     // main evaluation entry point with security checks
-    pub fn evaluate(self: *self, node: *const ast.AstNode) !exitstatus {
+    pub fn evaluate(self: *Self, node: *const ast.AstNode) !exitstatus {
         return switch (node.node_type) {
             .command => self.evaluatecommand(node),
             .list => self.evaluatelist(node),
@@ -59,7 +59,7 @@ pub const Executor = struct {
         };
     }
 
-    fn evaluatecommand(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluatecommand(self: *Self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len == 0) return error.emptycommand;
 
         const cmd_name = node.children[0].value;
@@ -85,7 +85,7 @@ pub const Executor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn evaluatelist(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluatelist(self: *Self, node: *const ast.AstNode) !exitstatus {
         var last_status = exitstatus{ .code = 0, .signal = null };
 
         for (node.children) |child| {
@@ -99,7 +99,7 @@ pub const Executor = struct {
         return last_status;
     }
 
-    fn evaluateif(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluateif(self: *Self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len < 2) return error.invalidsyntax;
 
         // evaluate condition
@@ -116,7 +116,7 @@ pub const Executor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn evaluatewhile(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluatewhile(self: *Self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len != 2) return error.invalidsyntax;
 
         var last_status = exitstatus{ .code = 0, .signal = null };
@@ -144,7 +144,7 @@ pub const Executor = struct {
         return last_status;
     }
 
-    fn evaluateuntil(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluateuntil(self: *Self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len != 2) return error.invalidsyntax;
 
         var last_status = exitstatus{ .code = 0, .signal = null };
@@ -172,7 +172,7 @@ pub const Executor = struct {
         return last_status;
     }
 
-    fn evaluatefor(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluatefor(self: *Self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len < 3) return error.invalidsyntax;
 
         const variable = node.children[0];
@@ -199,13 +199,13 @@ pub const Executor = struct {
         return last_status;
     }
 
-    fn evaluatesubshell(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluatesubshell(self: *Self, node: *const ast.AstNode) !exitstatus {
         // subshells would normally fork - for now just evaluate in current context
         if (node.children.len == 0) return error.emptysubshell;
         return self.evaluate(node.children[0]);
     }
 
-    fn evaluateassignment(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluateassignment(self: *Self, node: *const ast.AstNode) !exitstatus {
         if (node.children.len != 2) return error.invalidsyntax;
 
         const name_node = node.children[0];
@@ -217,7 +217,7 @@ pub const Executor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn evaluatepipeline(self: *self, node: *const ast.AstNode) !exitstatus {
+    fn evaluatepipeline(self: *Self, node: *const ast.AstNode) !exitstatus {
         // TODO: Implement proper pipeline with pipes
         // For now, just execute commands sequentially (this is wrong!)
         var last_status = exitstatus{ .code = 0, .signal = null };
@@ -233,7 +233,7 @@ pub const Executor = struct {
     }
 
     // builtin command implementations with security focus
-    fn isbuiltin(self: *self, cmd_name: []const u8) bool {
+    fn isbuiltin(self: *Self, cmd_name: []const u8) bool {
         _ = self;
         const builtins = [_][]const u8{
             "echo", "pwd", "cd", "exit", "export", "unset", "true", "false",
@@ -245,7 +245,7 @@ pub const Executor = struct {
         return false;
     }
 
-    fn executebuiltin(self: *self, cmd_name: []const u8, args: []const *const ast.AstNode) !exitstatus {
+    fn executebuiltin(self: *Self, cmd_name: []const u8, args: []const *const ast.AstNode) !exitstatus {
         if (std.mem.eql(u8, cmd_name, "echo")) {
             return self.builtinecho(args);
         } else if (std.mem.eql(u8, cmd_name, "pwd")) {
@@ -267,7 +267,7 @@ pub const Executor = struct {
         return error.unknownbuiltin;
     }
 
-    fn builtinecho(self: *self, args: []const *const ast.AstNode) !exitstatus {
+    fn builtinecho(self: *Self, args: []const *const ast.AstNode) !exitstatus {
         _ = self;
 
         for (args, 0..) |arg, i| {
@@ -282,13 +282,13 @@ pub const Executor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtinpwd(self: *self, args: []const *const ast.AstNode) !exitstatus {
+    fn builtinpwd(self: *Self, args: []const *const ast.AstNode) !exitstatus {
         _ = args;
         std.debug.print("{s}\n", .{self.environment.getcurrentdir()});
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtincd(self: *self, args: []const *const ast.AstNode) !exitstatus {
+    fn builtincd(self: *Self, args: []const *const ast.AstNode) !exitstatus {
         const target_path = if (args.len > 0)
             args[0].value
         else
@@ -302,7 +302,7 @@ pub const Executor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtinexit(self: *self, args: []const *const ast.AstNode) !exitstatus {
+    fn builtinexit(self: *Self, args: []const *const ast.AstNode) !exitstatus {
         _ = self;
 
         const exit_code: u8 = if (args.len > 0 and args[0].value.len > 0) blk: {
@@ -312,7 +312,7 @@ pub const Executor = struct {
         std.process.exit(exit_code);
     }
 
-    fn builtinexport(self: *self, args: []const *const ast.AstNode) !exitstatus {
+    fn builtinexport(self: *Self, args: []const *const ast.AstNode) !exitstatus {
         for (args) |arg| {
             const var_assignment = arg.value;
 
@@ -338,7 +338,7 @@ pub const Executor = struct {
         return exitstatus{ .code = 0, .signal = null };
     }
 
-    fn builtinunset(self: *self, args: []const *const ast.AstNode) !exitstatus {
+    fn builtinunset(self: *Self, args: []const *const ast.AstNode) !exitstatus {
         for (args) |arg| {
             try types.validateShellSafe(arg.value);
             _ = self.environment.unset(arg.value);
@@ -347,7 +347,7 @@ pub const Executor = struct {
     }
 
     // security: command whitelist
-    fn iscommandallowed(self: *self, cmd_name: []const u8) bool {
+    fn iscommandallowed(self: *Self, cmd_name: []const u8) bool {
         for (self.command_whitelist) |allowed_cmd| {
             if (std.crypto.utils.timingsafeeql(u8, cmd_name, allowed_cmd)) {
                 return true;
@@ -374,7 +374,7 @@ comptime {
             std.mem.eql(u8, cmd, "chown") or
             std.mem.eql(u8, cmd, "su") or
             std.mem.eql(u8, cmd, "sudo")) {
-            @compileerror("dangerous command in whitelist: " ++ cmd);
+            @compileError("dangerous command in whitelist: " ++ cmd);
         }
     }
 }

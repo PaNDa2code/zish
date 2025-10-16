@@ -32,12 +32,12 @@ pub const Parser = struct {
     peek_token: lexer.token,
     recursion_depth: types.RecursionDepth,
 
-    const self = @this();
+    const Self = @This();
 
-    pub fn init(input: []const u8, allocator: std.mem.allocator) !self {
+    pub fn init(input: []const u8, allocator: std.mem.allocator) !Self {
         var lex = try lexer.Lexer.init(input);
 
-        return self{
+        return Self{
             .lexer = lex,
             .builder = ast.AstBuilder.init(allocator),
             .state = .initial,
@@ -47,12 +47,12 @@ pub const Parser = struct {
         };
     }
 
-    pub fn deinit(self: *self) void {
+    pub fn deinit(self: *Self) void {
         self.builder.deinit();
     }
 
     // state-safe token advancement
-    pub fn nexttoken(self: *self) !void {
+    pub fn nexttoken(self: *Self) !void {
         switch (self.state) {
             .initial => {
                 self.current_token = try self.lexer.nexttoken();
@@ -69,7 +69,7 @@ pub const Parser = struct {
     }
 
     // main parsing entry point with security checks
-    pub fn parse(self: *self) !*const ast.AstNode {
+    pub fn parse(self: *Self) !*const ast.AstNode {
         // prime the parser
         try self.nexttoken();
 
@@ -83,7 +83,7 @@ pub const Parser = struct {
         return root;
     }
 
-    fn parsecommandlist(self: *self) parsererror!*const ast.AstNode {
+    fn parsecommandlist(self: *Self) parsererror!*const ast.AstNode {
         if (self.state != .hasboth) return error.invalidparserstate;
 
         var commands = std.arraylist(*const ast.AstNode).init(self.builder.arena.allocator());
@@ -124,7 +124,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parsepipeline(self: *self) parsererror!*const ast.AstNode {
+    fn parsepipeline(self: *Self) parsererror!*const ast.AstNode {
         var pipeline_commands = std.arraylist(*const ast.AstNode).init(self.builder.arena.allocator());
 
         // Parse first command
@@ -156,7 +156,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parsecommand(self: *self) parsererror!*const ast.AstNode {
+    fn parsecommand(self: *Self) parsererror!*const ast.AstNode {
         // recursion depth check
         if (self.recursion_depth >= types.MAX_RECURSION_DEPTH) {
             return error.recursionlimitexceeded;
@@ -177,7 +177,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parsesimplecommand(self: *self) parsererror!*const ast.AstNode {
+    fn parsesimplecommand(self: *Self) parsererror!*const ast.AstNode {
         var words = std.arraylist(*const ast.AstNode).init(self.builder.arena.allocator());
 
         while (self.current_token.ty != .eof) {
@@ -219,7 +219,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parseword(self: *self) parsererror!*const ast.AstNode {
+    fn parseword(self: *Self) parsererror!*const ast.AstNode {
         if (self.state != .hasboth) return error.invalidparserstate;
 
         const token = self.current_token;
@@ -241,7 +241,7 @@ pub const Parser = struct {
     }
 
     // control structure parsing with bounds checking
-    fn parseif(self: *self) parsererror!*const ast.AstNode {
+    fn parseif(self: *Self) parsererror!*const ast.AstNode {
         const if_token = self.current_token;
         try self.nexttoken(); // consume 'if'
 
@@ -280,7 +280,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parsewhile(self: *self) parsererror!*const ast.AstNode {
+    fn parsewhile(self: *Self) parsererror!*const ast.AstNode {
         const while_token = self.current_token;
         try self.nexttoken(); // consume 'while'
 
@@ -306,7 +306,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parseuntil(self: *self) parsererror!*const ast.AstNode {
+    fn parseuntil(self: *Self) parsererror!*const ast.AstNode {
         const until_token = self.current_token;
         try self.nexttoken(); // consume 'until'
 
@@ -332,7 +332,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parsefor(self: *self) parsererror!*const ast.AstNode {
+    fn parsefor(self: *Self) parsererror!*const ast.AstNode {
         const for_token = self.current_token;
         try self.nexttoken(); // consume 'for'
 
@@ -385,7 +385,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parsecase(self: *self) parsererror!*const ast.AstNode {
+    fn parsecase(self: *Self) parsererror!*const ast.AstNode {
         // simplified case parsing - full implementation would be more complex
         const case_token = self.current_token;
         try self.nexttoken(); // consume 'case'
@@ -416,7 +416,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parsegroup(self: *self) parsererror!*const ast.AstNode {
+    fn parsegroup(self: *Self) parsererror!*const ast.AstNode {
         const brace_token = self.current_token;
         try self.nexttoken(); // consume '{'
 
@@ -436,7 +436,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parsesubshell(self: *self) parsererror!*const ast.AstNode {
+    fn parsesubshell(self: *Self) parsererror!*const ast.AstNode {
         const paren_token = self.current_token;
         try self.nexttoken(); // consume '('
 
@@ -460,7 +460,7 @@ pub const Parser = struct {
 // compile-time security checks
 comptime {
     // ensure parser cannot be used for dos
-    if (@sizeof(Parser) > 1024) {
-        @compileerror("parser too large - potential memory exhaustion");
+    if (@sizeOf(Parser) > 1024) {
+        @compileError("parser too large - potential memory exhaustion");
     }
 }

@@ -66,23 +66,23 @@ pub const AstBuilder = struct {
     node_count: u32,  // prevent ast explosion
 
     const max_nodes = 1024;  // prevent dos via massive asts
-    const self = @this();
+    const Self = @This();
 
-    pub fn init(parent_allocator: std.mem.allocator) self {
-        return self{
+    pub fn init(parent_allocator: std.mem.allocator) Self {
+        return Self{
             .arena = std.heap.arenaallocator.init(parent_allocator),
             .depth = 0,
             .node_count = 0,
         };
     }
 
-    pub fn deinit(self: *self) void {
+    pub fn deinit(self: *Self) void {
         // arena cleanup handles everything - no double-free possible
         self.arena.deinit();
     }
 
     pub fn createnode(
-        self: *self,
+        self: *Self,
         node_type: NodeType,
         value: []const u8,
         children: []const *const AstNode,
@@ -119,21 +119,21 @@ pub const AstBuilder = struct {
         return node;
     }
 
-    pub fn createword(self: *self, value: []const u8, line: u32, column: u32) !*const AstNode {
+    pub fn createword(self: *Self, value: []const u8, line: u32, column: u32) !*const AstNode {
         // TODO: add validation if needed
         return self.createnode(.word, value, &[_]*const AstNode{}, line, column);
     }
 
-    pub fn createstring(self: *self, value: []const u8, line: u32, column: u32) !*const AstNode {
+    pub fn createstring(self: *Self, value: []const u8, line: u32, column: u32) !*const AstNode {
         return self.createnode(.string, value, &[_]*const AstNode{}, line, column);
     }
 
-    pub fn createcommand(self: *self, words: []const *const AstNode, line: u32, column: u32) !*const AstNode {
+    pub fn createcommand(self: *Self, words: []const *const AstNode, line: u32, column: u32) !*const AstNode {
         if (words.len == 0) return error.emptycommand;
         return self.createnode(.command, "", words, line, column);
     }
 
-    pub fn createassignment(self: *self, name: []const u8, value: []const u8, line: u32, column: u32) !*const AstNode {
+    pub fn createassignment(self: *Self, name: []const u8, value: []const u8, line: u32, column: u32) !*const AstNode {
         // Create variable name and value nodes
         const name_node = try self.createword(name, line, column);
         const value_node = try self.createstring(value, line, column);
@@ -142,7 +142,7 @@ pub const AstBuilder = struct {
         return self.createnode(.assignment, "", &children, line, column);
     }
 
-    pub fn createif(self: *self, condition: *const AstNode, then_branch: *const AstNode, else_branch: ?*const AstNode, line: u32, column: u32) !*const AstNode {
+    pub fn createif(self: *Self, condition: *const AstNode, then_branch: *const AstNode, else_branch: ?*const AstNode, line: u32, column: u32) !*const AstNode {
         self.depth += 1;
         defer self.depth -= 1;
 
@@ -160,7 +160,7 @@ pub const AstBuilder = struct {
         return self.createnode(.if_statement, "", children_buf[0..child_count], line, column);
     }
 
-    pub fn createwhile(self: *self, condition: *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
+    pub fn createwhile(self: *Self, condition: *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
         self.depth += 1;
         defer self.depth -= 1;
 
@@ -168,7 +168,7 @@ pub const AstBuilder = struct {
         return self.createnode(.while_loop, "", &children, line, column);
     }
 
-    pub fn createfor(self: *self, variable: *const AstNode, values: []const *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
+    pub fn createfor(self: *Self, variable: *const AstNode, values: []const *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
         self.depth += 1;
         defer self.depth -= 1;
 
@@ -183,12 +183,12 @@ pub const AstBuilder = struct {
         return self.createnode(.for_loop, "", children, line, column);
     }
 
-    pub fn createpipeline(self: *self, commands: []const *const AstNode, line: u32, column: u32) !*const AstNode {
+    pub fn createpipeline(self: *Self, commands: []const *const AstNode, line: u32, column: u32) !*const AstNode {
         if (commands.len < 2) return error.invalidpipeline;
         return self.createnode(.pipeline, "", commands, line, column);
     }
 
-    pub fn createlist(self: *self, commands: []const *const AstNode, line: u32, column: u32) !*const AstNode {
+    pub fn createlist(self: *Self, commands: []const *const AstNode, line: u32, column: u32) !*const AstNode {
         return self.createnode(.list, "", commands, line, column);
     }
 
@@ -255,7 +255,7 @@ fn validatenode(node: *const AstNode) !void {
 
 // compile-time security checks
 comptime {
-    if (@sizeof(AstNode) > 64) {
-        @compileerror("ast node too large - potential memory exhaustion");
+    if (@sizeOf(AstNode) > 64) {
+        @compileError("ast node too large - potential memory exhaustion");
     }
 }

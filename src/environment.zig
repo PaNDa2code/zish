@@ -11,21 +11,21 @@ pub const Environment = struct {
     current_dir: []const u8,
     exit_status: i32,
 
-    const self = @this();
+    const Self = @This();
     const stringcontext = struct {
-        pub fn hash(_: @this(), s: types.InternedString) u64 {
+        pub fn hash(_: @This(), s: types.InternedString) u64 {
             return std.hash_map.hashstring(s.data);
         }
-        pub fn eql(_: @this(), a: types.InternedString, b: types.InternedString) bool {
+        pub fn eql(_: @This(), a: types.InternedString, b: types.InternedString) bool {
             return a.eql(b);
         }
     };
 
-    pub fn init(parent_allocator: std.mem.allocator, caps: std.enumset(types.EnvironmentCapability)) !*self {
+    pub fn init(parent_allocator: std.mem.allocator, caps: std.enumset(types.EnvironmentCapability)) !*Self {
         var arena = std.heap.arenaallocator.init(parent_allocator);
         const allocator = arena.allocator();
 
-        const env = try allocator.create(self);
+        const env = try allocator.create(Self);
         env.* = .{
             .arena = arena,
             .capabilities = caps,
@@ -39,17 +39,17 @@ pub const Environment = struct {
         return env;
     }
 
-    pub fn deinit(self: *self) void {
+    pub fn deinit(self: *Self) void {
         // arena cleanup handles all memory - no double-free possible
         self.arena.deinit();
     }
 
-    pub fn get(self: *self, name: []const u8) ?[]const u8 {
+    pub fn get(self: *Self, name: []const u8) ?[]const u8 {
         const interned = types.InternedString{ .data = name };
         return self.variables.get(interned);
     }
 
-    pub fn set(self: *self, name: []const u8, value: []const u8) !void {
+    pub fn set(self: *Self, name: []const u8, value: []const u8) !void {
         try types.validateShellSafe(name);
         try types.validateShellSafe(value);
 
@@ -67,16 +67,16 @@ pub const Environment = struct {
         try self.variables.put(interned_name, value_copy);
     }
 
-    pub fn unset(self: *self, name: []const u8) bool {
+    pub fn unset(self: *Self, name: []const u8) bool {
         const interned = types.InternedString{ .data = name };
         return self.variables.remove(interned);
     }
 
-    pub fn getcurrentdir(self: *self) []const u8 {
+    pub fn getcurrentdir(self: *Self) []const u8 {
         return self.current_dir;
     }
 
-    pub fn setcurrentdir(self: *self, path: []const u8) !void {
+    pub fn setcurrentdir(self: *Self, path: []const u8) !void {
         try types.validateShellSafe(path);
 
         const allocator = self.arena.allocator();
@@ -88,7 +88,7 @@ pub const Environment = struct {
         try self.set("pwd", new_path);
     }
 
-    pub fn expandvariable(self: *self, name: []const u8) ![]const u8 {
+    pub fn expandvariable(self: *Self, name: []const u8) ![]const u8 {
         // handle special variables with arena allocation - no stack return issues
         const allocator = self.arena.allocator();
 
@@ -103,7 +103,7 @@ pub const Environment = struct {
     }
 
     // capability-restricted environment import
-    fn importsystemenv(self: *self) !void {
+    fn importsystemenv(self: *Self) !void {
         if (self.capabilities.contains(.readuserinfo)) {
             try self.importsafeenvvars(&[_][]const u8{ "home", "user" });
         }
@@ -129,7 +129,7 @@ pub const Environment = struct {
         try self.set("shell", "/bin/zish");
     }
 
-    fn importsafeenvvars(self: *self, var_names: []const []const u8) !void {
+    fn importsafeenvvars(self: *Self, var_names: []const []const u8) !void {
         for (var_names) |var_name| {
             if (std.posix.getenv(var_name)) |value| {
                 const clean_value = try self.sanitizeenvvalue(value);
@@ -138,7 +138,7 @@ pub const Environment = struct {
         }
     }
 
-    fn sanitizeenvvalue(self: *self, value: []const u8) ![]const u8 {
+    fn sanitizeenvvalue(self: *Self, value: []const u8) ![]const u8 {
         // length limit
         if (value.len > types.MAX_ENV_VALUE_LENGTH) {
             return error.environmentvaluetoolong;
@@ -157,7 +157,7 @@ pub const Environment = struct {
         return self.arena.allocator().dupe(u8, value);
     }
 
-    fn sanitizepath(self: *self, path_value: []const u8) ![]const u8 {
+    fn sanitizepath(self: *Self, path_value: []const u8) ![]const u8 {
         const allocator = self.arena.allocator();
         var safe_paths = std.arraylist([]const u8).init(allocator);
 
@@ -172,7 +172,7 @@ pub const Environment = struct {
         return std.mem.join(allocator, ":", safe_paths.items);
     }
 
-    fn ispathsafe(self: *self, path: []const u8) bool {
+    fn ispathsafe(self: *Self, path: []const u8) bool {
         _ = self;
 
         // reject dangerous paths
@@ -194,16 +194,16 @@ pub const Environment = struct {
         return false;
     }
 
-    pub fn setexitstatus(self: *self, status: i32) void {
+    pub fn setexitstatus(self: *Self, status: i32) void {
         self.exit_status = status;
     }
 
-    pub fn getexitstatus(self: *self) i32 {
+    pub fn getexitstatus(self: *Self) i32 {
         return self.exit_status;
     }
 
     // secure environment export for external commands
-    pub fn getenvp(self: *self) ![][*:0]const u8 {
+    pub fn getenvp(self: *Self) ![][*:0]const u8 {
         const allocator = self.arena.allocator();
         var env_array = std.arraylist([*:0]const u8).init(allocator);
 
@@ -224,7 +224,7 @@ pub const Environment = struct {
 // compile-time security invariants
 comptime {
     // ensure environment cannot be used to bypass security
-    if (@sizeof(types.InternedString) > 16) {
-        @compileerror("interned strings too large - potential dos vector");
+    if (@sizeOf(types.InternedString) > 16) {
+        @compileError("interned strings too large - potential dos vector");
     }
 }

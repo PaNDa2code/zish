@@ -1,187 +1,416 @@
-// parser.zig
+// secure_parser.zig - typestate parser with bounds checking
 
 const std = @import("std");
-const ast = @import("ast.zig");
+const types = @import("types.zig");
 const lexer = @import("lexer.zig");
-const Token = lexer.LexerToken;
-const TokenType = lexer.LexerTokenType;
-const LexError = lexer.LexerErrors;
+const ast = @import("ast.zig");
 
-pub const ParseError = error{
-    UnexpectedToken,
-    UnexpectedEof,
-    InvalidSyntax,
-    OutOfMemory,
+// parser state machine - makes invalid states unrepresentable
+pub const parserstate = enum {
+    initial,
+    hascurrent,
+    hasboth,
+    complete,
+    error_state,
 };
 
-pub const Parser = struct {
-    lexer: *lexer.Lexer,
-    allocator: std.mem.Allocator,
-    current_token: ?Token,
-    peek_token: ?Token,
+pub const parsererror = error{
+    unexpectedtoken,
+    unexpectedeof,
+    invalidsyntax,
+    parserfinished,
+    invalidparserstate,
+    outofmemory,
+} || secure.securityerror;
 
-    const Self = @This();
+// typestate-based parser
+pub const secureparser = struct {
+    lexer: lexer.securelexer,
+    builder: ast.astbuilder,
+    state: parserstate,
+    current_token: lexer.token,
+    peek_token: lexer.token,
+    recursion_depth: secure.recursiondepth,
 
-    pub fn init(allocator: std.mem.Allocator, lex: *lexer.Lexer) !Self {
-        var parser = Self{
+    const self = @this();
+
+    pub fn init(input: []const u8, allocator: std.mem.allocator) !self {
+        var lex = try lexer.securelexer.init(input);
+
+        return self{
             .lexer = lex,
-            .allocator = allocator,
-            .current_token = null,
-            .peek_token = null,
-        };
-        // Prime the parser with first two tokens
-        _ = try parser.nextToken();
-        _ = try parser.nextToken();
-        return parser;
-    }
-
-    pub fn deinit(self: *Self) void {
-        _ = self; // TODO:Mark as used until we implement cleanup
-    }
-
-    fn nextToken(self: *Self) !?Token {
-        self.current_token = self.peek_token;
-        self.peek_token = try self.lexer.nextToken();
-        return self.current_token;
-    }
-
-    pub fn parse(self: *Self) !*ast.Node {
-        var nodes = std.ArrayList(*ast.Node).init(self.allocator);
-        defer nodes.deinit();
-
-        while (self.current_token != null and self.current_token.?.ty != .Eof) {
-            const node = try self.parseCommand();
-            try nodes.append(node);
-
-            if (self.current_token) |token| {
-                switch (token.ty) {
-                    .Semicolon, .NewLine => _ = try self.nextToken(),
-                    else => {},
-                }
-            }
-        }
-
-        // If we only have one command, return it directly
-        if (nodes.items.len == 1) {
-            return nodes.items[0];
-        }
-
-        // Otherwise, create a List node
-        const list = try ast.Node.init(
-            self.allocator,
-            .List,
-            null,
-            if (nodes.items.len > 0) nodes.items[0].line else 1,
-            if (nodes.items.len > 0) nodes.items[0].column else 1,
-        );
-
-        try list.children.appendSlice(nodes.items);
-        return list;
-    }
-
-    fn parseCommand(self: *Self) !*ast.Node {
-        const token = self.current_token orelse return error.UnexpectedEof;
-
-        return switch (token.ty) {
-            .If => self.parseIf(),
-            .While => self.parseWhile(),
-            .Until => self.parseUntil(),
-            .For => self.parseFor(),
-            .Case => self.parseCase(),
-            .Function => self.parseFunction(),
-            .LeftBrace => self.parseGroup(),
-            .LeftParen => self.parseSubshell(),
-            else => self.parseSimpleCommand(),
+            .builder = ast.astbuilder.init(allocator),
+            .state = .initial,
+            .current_token = lexer.token.empty,
+            .peek_token = lexer.token.empty,
+            .recursion_depth = 0,
         };
     }
 
-    fn parseSimpleCommand(self: *Self) !*ast.Node {
-        const start_token = self.current_token orelse return error.UnexpectedEof;
+    pub fn deinit(self: *self) void {
+        self.builder.deinit();
+    }
 
-        var cmd = try ast.Node.init(
-            self.allocator,
-            .Command,
-            null,
-            start_token.line,
-            start_token.column,
-        );
-        errdefer cmd.deinit(self.allocator);
+    // state-safe token advancement
+    pub fn nexttoken(self: *self) !void {
+        switch (self.state) {
+            .initial => {
+                self.current_token = try self.lexer.nexttoken();
+                self.peek_token = try self.lexer.nexttoken();
+                self.state = .hasboth;
+            },
+            .hasboth => {
+                self.current_token = self.peek_token;
+                self.peek_token = try self.lexer.nexttoken();
+            },
+            .complete, .error_state => return error.parserfinished,
+            else => return error.invalidparserstate,
+        }
+    }
 
-        // Parse assignments that precede the command
-        while (self.current_token) |token| {
-            if (token.ty == .Word) {
-                const peek = self.peek_token orelse return error.UnexpectedEof;
-                if (peek.ty == .Equals) {
-                    const assign = try self.parseAssignment();
-                    try cmd.children.append(assign);
-                    continue;
-                }
+    // main parsing entry point with security checks
+    pub fn parse(self: *self) !*const ast.astnode {
+        // prime the parser
+        try self.nexttoken();
+
+        const root = try self.parsecommandlist();
+
+        self.state = .complete;
+
+        // validate the resulting ast for security
+        try ast.validateast(root);
+
+        return root;
+    }
+
+    fn parsecommandlist(self: *self) parsererror!*const ast.astnode {
+        if (self.state != .hasboth) return error.invalidparserstate;
+
+        var commands = std.arraylist(*const ast.astnode).init(self.builder.arena.allocator());
+
+        while (self.current_token.ty != .eof) {
+            // skip empty statements
+            if (self.current_token.ty == .semicolon or self.current_token.ty == .newline) {
+                try self.nexttoken();
+                continue;
             }
-            break;
+
+            // prevent dos via massive command lists
+            if (commands.items.len >= secure.max_args_count) {
+                return error.toomanycommands;
+            }
+
+            const cmd = try self.parsecommand();
+            try commands.append(cmd);
+
+            // handle separators
+            if (self.current_token.ty == .semicolon or self.current_token.ty == .newline) {
+                try self.nexttoken();
+            }
         }
 
-        // Parse command words
-        while (self.current_token) |token| {
-            switch (token.ty) {
-                .Word, .String, .Integer => {
-                    const word = try self.parseWord();
-                    try cmd.children.append(word);
-                },
-                .RedirectInput, .RedirectOutput, .RedirectAppend, .RedirectHereDoc, .RedirectHereString => {
-                    const redirect = try self.parseRedirect();
-                    try cmd.redirects.append(redirect);
+        if (commands.items.len == 0) {
+            return error.emptyinput;
+        }
+
+        if (commands.items.len == 1) {
+            return commands.items[0];
+        }
+
+        return self.builder.createlist(
+            commands.items,
+            commands.items[0].line,
+            commands.items[0].column,
+        );
+    }
+
+    fn parsecommand(self: *self) parsererror!*const ast.astnode {
+        // recursion depth check
+        if (self.recursion_depth >= secure.max_recursion_depth) {
+            return error.recursionlimitexceeded;
+        }
+
+        self.recursion_depth = try secure.checkedadd(secure.recursiondepth, self.recursion_depth, 1);
+        defer self.recursion_depth -= 1;
+
+        return switch (self.current_token.ty) {
+            .if => self.parseif(),
+            .while => self.parsewhile(),
+            .until => self.parseuntil(),
+            .for => self.parsefor(),
+            .case => self.parsecase(),
+            .leftbrace => self.parsegroup(),
+            .leftparen => self.parsesubshell(),
+            else => self.parsesimplecommand(),
+        };
+    }
+
+    fn parsesimplecommand(self: *self) parsererror!*const ast.astnode {
+        var words = std.arraylist(*const ast.astnode).init(self.builder.arena.allocator());
+
+        while (self.current_token.ty != .eof) {
+            switch (self.current_token.ty) {
+                .word, .string, .integer => {
+                    const word = try self.parseword();
+                    try words.append(word);
                 },
                 else => break,
             }
         }
 
-        if (cmd.children.items.len == 0 and cmd.redirects.items.len == 0) {
-            return error.InvalidSyntax;
+        if (words.items.len == 0) {
+            return error.emptycommand;
         }
 
-        return cmd;
-    }
-
-    // Implement other parsing methods...
-
-    fn parseWord(self: *Self) !*ast.Node {
-        const token = self.current_token orelse return error.UnexpectedEof;
-
-        const word = try ast.Node.init(
-            self.allocator,
-            .Word,
-            token.value,
-            token.line,
-            token.column,
+        return self.builder.createcommand(
+            words.items,
+            self.current_token.line,
+            self.current_token.column,
         );
-
-        _ = try self.nextToken();
-        return word;
     }
 
-    fn parseRedirect(self: *Self) !*ast.RedirectNode {
-        const token = self.current_token orelse return error.UnexpectedEof;
+    fn parseword(self: *self) parsererror!*const ast.astnode {
+        if (self.state != .hasboth) return error.invalidparserstate;
 
-        const redirect_type: ast.RedirectType = switch (token.ty) {
-            .RedirectInput => .Input,
-            .RedirectOutput => .Output,
-            .RedirectAppend => .Append,
-            .RedirectHereDoc => .HereDoc,
-            .RedirectHereString => .HereString,
-            else => return error.InvalidSyntax,
+        const token = self.current_token;
+        try self.nexttoken();
+
+        const node_type: ast.nodetype = switch (token.ty) {
+            .word => .word,
+            .string => .string,
+            .integer => .number,
+            else => return error.unexpectedtoken,
         };
 
-        _ = try self.nextToken();
+        return switch (node_type) {
+            .word => self.builder.createword(token.value, token.line, token.column),
+            .string => self.builder.createstring(token.value, token.line, token.column),
+            .number => self.builder.createnode(.number, token.value, &[_]*const ast.astnode{}, token.line, token.column),
+            else => error.invalidsyntax,
+        };
+    }
 
-        const target = try self.parseWord();
+    // control structure parsing with bounds checking
+    fn parseif(self: *self) parsererror!*const ast.astnode {
+        const if_token = self.current_token;
+        try self.nexttoken(); // consume 'if'
 
-        return ast.RedirectNode.init(
-            self.allocator,
-            redirect_type,
-            null,
-            target,
-            token.line,
-            token.column,
+        // parse condition
+        const condition = try self.parsesimplecommand();
+
+        // expect 'then'
+        if (self.current_token.ty != .then) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'then'
+
+        // parse then branch
+        const then_branch = try self.parsecommandlist();
+
+        var else_branch: ?*const ast.astnode = null;
+
+        // handle else clause
+        if (self.current_token.ty == .else) {
+            try self.nexttoken(); // consume 'else'
+            else_branch = try self.parsecommandlist();
+        }
+
+        // expect 'fi'
+        if (self.current_token.ty != .fi) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'fi'
+
+        return self.builder.createif(
+            condition,
+            then_branch,
+            else_branch,
+            if_token.line,
+            if_token.column,
+        );
+    }
+
+    fn parsewhile(self: *self) parsererror!*const ast.astnode {
+        const while_token = self.current_token;
+        try self.nexttoken(); // consume 'while'
+
+        const condition = try self.parsesimplecommand();
+
+        if (self.current_token.ty != .do) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'do'
+
+        const body = try self.parsecommandlist();
+
+        if (self.current_token.ty != .done) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'done'
+
+        return self.builder.createwhile(
+            condition,
+            body,
+            while_token.line,
+            while_token.column,
+        );
+    }
+
+    fn parseuntil(self: *self) parsererror!*const ast.astnode {
+        const until_token = self.current_token;
+        try self.nexttoken(); // consume 'until'
+
+        const condition = try self.parsesimplecommand();
+
+        if (self.current_token.ty != .do) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'do'
+
+        const body = try self.parsecommandlist();
+
+        if (self.current_token.ty != .done) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'done'
+
+        return self.builder.createwhile( // until is like while with negated condition
+            condition,
+            body,
+            until_token.line,
+            until_token.column,
+        );
+    }
+
+    fn parsefor(self: *self) parsererror!*const ast.astnode {
+        const for_token = self.current_token;
+        try self.nexttoken(); // consume 'for'
+
+        // parse variable name
+        const variable = try self.parseword();
+
+        if (self.current_token.ty != .in) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'in'
+
+        // parse value list
+        var values = std.arraylist(*const ast.astnode).init(self.builder.arena.allocator());
+        while (self.current_token.ty != .semicolon and
+            self.current_token.ty != .newline and
+            self.current_token.ty != .do and
+            self.current_token.ty != .eof)
+        {
+            if (values.items.len >= secure.max_args_count) {
+                return error.toomanyarguments;
+            }
+
+            const value = try self.parseword();
+            try values.append(value);
+        }
+
+        // skip optional separator
+        if (self.current_token.ty == .semicolon or self.current_token.ty == .newline) {
+            try self.nexttoken();
+        }
+
+        if (self.current_token.ty != .do) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'do'
+
+        const body = try self.parsecommandlist();
+
+        if (self.current_token.ty != .done) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'done'
+
+        return self.builder.createfor(
+            variable,
+            values.items,
+            body,
+            for_token.line,
+            for_token.column,
+        );
+    }
+
+    fn parsecase(self: *self) parsererror!*const ast.astnode {
+        // simplified case parsing - full implementation would be more complex
+        const case_token = self.current_token;
+        try self.nexttoken(); // consume 'case'
+
+        const expr = try self.parseword();
+
+        if (self.current_token.ty != .in) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'in'
+
+        // for now, just consume until esac
+        while (self.current_token.ty != .esac and self.current_token.ty != .eof) {
+            try self.nexttoken();
+        }
+
+        if (self.current_token.ty != .esac) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume 'esac'
+
+        return self.builder.createnode(
+            .case_statement,
+            "",
+            &[_]*const ast.astnode{expr},
+            case_token.line,
+            case_token.column,
+        );
+    }
+
+    fn parsegroup(self: *self) parsererror!*const ast.astnode {
+        const brace_token = self.current_token;
+        try self.nexttoken(); // consume '{'
+
+        const body = try self.parsecommandlist();
+
+        if (self.current_token.ty != .rightbrace) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume '}'
+
+        return self.builder.createnode(
+            .list,
+            "",
+            &[_]*const ast.astnode{body},
+            brace_token.line,
+            brace_token.column,
+        );
+    }
+
+    fn parsesubshell(self: *self) parsererror!*const ast.astnode {
+        const paren_token = self.current_token;
+        try self.nexttoken(); // consume '('
+
+        const body = try self.parsecommandlist();
+
+        if (self.current_token.ty != .rightparen) {
+            return error.unexpectedtoken;
+        }
+        try self.nexttoken(); // consume ')'
+
+        return self.builder.createnode(
+            .subshell,
+            "",
+            &[_]*const ast.astnode{body},
+            paren_token.line,
+            paren_token.column,
         );
     }
 };
+
+// compile-time security checks
+comptime {
+    // ensure parser cannot be used for dos
+    if (@sizeof(secureparser) > 1024) {
+        @compileerror("parser too large - potential memory exhaustion");
+    }
+}

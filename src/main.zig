@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Shell = @import("shell.zig").Shell;
+const build_options = @import("build_options");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -19,20 +20,7 @@ pub fn main() !void {
     if (args.len > 1) {
         // check for version flags
         if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
-            const version_file = std.fs.cwd().openFile("VERSION", .{}) catch {
-                std.debug.print("zish (version unknown)\n", .{});
-                return;
-            };
-            defer version_file.close();
-
-            var version_buf: [32]u8 = undefined;
-            const bytes_read = version_file.readAll(&version_buf) catch {
-                std.debug.print("zish (version unknown)\n", .{});
-                return;
-            };
-
-            const version = std.mem.trim(u8, version_buf[0..bytes_read], " \t\n\r");
-            std.debug.print("zish {s}\n", .{version});
+            std.debug.print("zish {s}\n", .{build_options.version});
             return;
         }
 

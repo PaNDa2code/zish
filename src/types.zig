@@ -73,6 +73,39 @@ pub const InternedString = struct {
     }
 };
 
+// token types for lexer
+pub const TokenType = enum {
+    Word,
+    String,
+    Number,
+    Semicolon,
+    Pipe,
+    Ampersand,
+    LeftParen,
+    RightParen,
+    LeftBrace,
+    RightBrace,
+    RedirectIn,
+    RedirectOut,
+    RedirectAppend,
+    EOF,
+    Newline,
+    // Keywords
+    If,
+    Then,
+    Else,
+    Elif,
+    Fi,
+    For,
+    While,
+    Until,
+    Do,
+    Done,
+    Case,
+    Esac,
+    Function,
+};
+
 // error types with security context
 pub const SecurityError = error{
     IntegerOverflow,

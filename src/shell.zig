@@ -39,6 +39,7 @@ const Colors = struct {
 // Control character constants for better readability
 const CTRL_C = 3;
 const CTRL_T = 20;
+const CTRL_L = 12;
 const ESC = 27;
 const BACKSPACE = 8;
 const DELETE = 127;
@@ -151,6 +152,8 @@ pub const Shell = struct {
         } else "E"; // E for emacs/normal editing mode
 
         // mild colorful prompt: [mode] user@host ~/path $
+        // TODO: replace usage of `std.debug.print` with `std.io.Writer`
+        // interface to be able to use a buffered writer
         std.debug.print("{s}[{s}{s}{s}] {s}{s}@{s}{s} {s}{s}{s} $ ", .{
             Colors.bold,     mode_color,   mode_indicator, Colors.reset,
             Colors.userhost, user,         hostname,       Colors.reset,
@@ -294,6 +297,11 @@ pub const Shell = struct {
                                 std.debug.print("{s}", .{buf[0..pos]});
                             }
                             continue;
+                        },
+                        CTRL_L => {
+                            // TODO
+                            // std.debug.print("\x1b[2J\x1b[H", .{});
+                            // try self.redrawLine(buf, 0);
                         },
                         '\t' => {
                             // handle tab completion
@@ -887,7 +895,7 @@ pub const Shell = struct {
     }
 
     fn redrawLine(self: *Self, buf: *[types.MAX_COMMAND_LENGTH]u8, cursor_pos: usize) !void {
-        const input_len = self.findInputEnd(buf);
+        const input_len = @min(self.findInputEnd(buf), cursor_pos);
 
         // clear current line and redraw prompt + input
         std.debug.print("\r\x1b[2K", .{});
@@ -900,13 +908,16 @@ pub const Shell = struct {
         // position cursor at the right place
         if (cursor_pos < input_len) {
             const back_chars = input_len - cursor_pos;
-            for (0..back_chars) |_| {
-                std.debug.print("\x1b[D", .{}); // move cursor left
-            }
+            std.debug.print("\x1b[{d}D", .{back_chars});
         }
     }
 
-    fn handleEscapeSequence(self: *Self, stdin: *const std.fs.File, buf: *[types.MAX_COMMAND_LENGTH]u8, pos: usize) !EscapeResult {
+    fn handleEscapeSequence(
+        self: *Self,
+        stdin: *const std.fs.File,
+        buf: *[types.MAX_COMMAND_LENGTH]u8,
+        pos: usize,
+    ) !EscapeResult {
         var temp_buf: [1]u8 = undefined;
 
         // For vim mode: if we're in insert mode, try to detect plain Escape vs escape sequences
@@ -946,6 +957,7 @@ pub const Shell = struct {
             'A' => blk: {
                 if (self.vim_mode == .insert) {
                     const new_pos = try self.handleUpArrow(buf, pos);
+                    try self.redrawLine(buf, new_pos);
                     break :blk EscapeResult{ .action = .set_position, .new_pos = new_pos };
                 }
                 break :blk EscapeResult{ .action = .continue_loop };
@@ -953,6 +965,7 @@ pub const Shell = struct {
             'B' => blk: {
                 if (self.vim_mode == .insert) {
                     const new_pos = try self.handleDownArrow(buf, pos);
+                    try self.redrawLine(buf, new_pos);
                     break :blk EscapeResult{ .action = .set_position, .new_pos = new_pos };
                 }
                 break :blk EscapeResult{ .action = .continue_loop };
@@ -1552,4 +1565,3 @@ pub const Shell = struct {
         };
     }
 };
-

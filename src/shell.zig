@@ -299,9 +299,12 @@ pub const Shell = struct {
                             continue;
                         },
                         CTRL_L => {
-                            // TODO
-                            // std.debug.print("\x1b[2J\x1b[H", .{});
-                            // try self.redrawLine(buf, 0);
+                            std.debug.print("\x1b[2J\x1b[H", .{});
+                            try self.printFancyPrompt();
+                            if (pos > 0) {
+                                std.debug.print("{s}", .{buf[0..pos]});
+                            }
+                            continue;
                         },
                         '\t' => {
                             // handle tab completion
@@ -579,6 +582,7 @@ pub const Shell = struct {
                             try self.printFancyPrompt();
                         },
                         '\n' => {
+                            std.debug.print("\n", .{});
                             buf[pos] = 0; // null terminate
                             const input = std.mem.trim(u8, buf[0..pos], " \t\n\r");
                             // return to insert mode for next command

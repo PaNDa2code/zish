@@ -9,6 +9,8 @@ pub fn build(b: *std.Build) void {
     // Default to ReleaseFast for production performance
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
+    const clap = b.dependency("clap", .{});
+
     // Performance build options
     const enable_simd = b.option(bool, "simd", "Enable SIMD optimizations") orelse true;
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization") orelse (optimize != .Debug);
@@ -27,6 +29,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zish", .module = mod },
+                .{ .name = "clap", .module = clap.module("clap") },
             },
         }),
     });
@@ -82,5 +85,4 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-
 }

@@ -66,6 +66,8 @@ pub const Shell = struct {
     search_buffer: []u8,
     search_len: usize = 0,
 
+    stdout_writer: std.fs.File.Writer,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -78,6 +80,8 @@ pub const Shell = struct {
         const cmd_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
         const clipboard_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
         const search_buffer = try allocator.alloc(u8, 256); // search queries are usually short
+
+        const writer_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH * 2);
 
         shell.* = .{
             .allocator = allocator,
@@ -97,6 +101,7 @@ pub const Shell = struct {
             .search_mode = false,
             .search_buffer = search_buffer,
             .search_len = 0,
+            .stdout_writer = .init(.stdout(), writer_buffer),
         };
 
         // set terminal to raw mode for proper input handling
@@ -106,6 +111,10 @@ pub const Shell = struct {
         shell.loadAliases() catch {}; // don't fail if no config file
 
         return shell;
+    }
+
+    inline fn stdout(self: *Self) *std.Io.Writer {
+        return &self.stdout_writer.interface;
     }
 
     fn printFancyPrompt(self: *Self) !void {
@@ -152,9 +161,7 @@ pub const Shell = struct {
         } else "E"; // E for emacs/normal editing mode
 
         // mild colorful prompt: [mode] user@host ~/path $
-        // TODO: replace usage of `std.debug.print` with `std.io.Writer`
-        // interface to be able to use a buffered writer
-        std.debug.print("{s}[{s}{s}{s}] {s}{s}@{s}{s} {s}{s}{s} $ ", .{
+        try self.stdout().print("{s}[{s}{s}{s}] {s}{s}@{s}{s} {s}{s}{s} $ ", .{
             Colors.bold,     mode_color,   mode_indicator, Colors.reset,
             Colors.userhost, user,         hostname,       Colors.reset,
             Colors.path,     display_path, Colors.reset,
@@ -168,10 +175,12 @@ pub const Shell = struct {
 
         while (pos < buf.len - 1) {
             const bytes_read = stdin.read(buf[pos .. pos + 1]) catch |err| {
-                std.debug.print("input error: {}\n", .{err});
+                try self.stdout().print("input error: {}\n", .{err});
                 self.running = false;
                 return null;
             };
+
+            defer self.stdout().flush() catch unreachable;
 
             if (bytes_read == 0) {
                 self.running = false;
@@ -191,10 +200,10 @@ pub const Shell = struct {
                     },
                     .switch_to_normal => {
                         self.vim_mode = .normal;
-                        std.debug.print("\r", .{});
+                        try self.stdout().writeByte('\r');
                         try self.printFancyPrompt();
                         if (pos > 0) {
-                            std.debug.print("{s}", .{buf[0..pos]});
+                            try self.stdout().writeAll(buf[0..pos]);
                         }
                         continue;
                     },
@@ -207,7 +216,7 @@ pub const Shell = struct {
                     '\n' => {
                         // execute search
                         self.search_mode = false;
-                        std.debug.print("\r", .{});
+                        try self.stdout().writeByte('\r');
                         try self.printFancyPrompt();
                         // perform history search with search_buffer
                         if (self.search_len > 0 and self.hist != null) {
@@ -221,7 +230,7 @@ pub const Shell = struct {
                                 const copy_len = @min(cmd.len, buf.len - 1);
                                 @memcpy(buf[0..copy_len], cmd[0..copy_len]);
                                 pos = copy_len;
-                                std.debug.print("{s}", .{buf[0..pos]});
+                                try self.stdout().writeAll(buf[0..pos]);
                                 self.cursor_pos = pos;
                             }
                         }
@@ -231,10 +240,10 @@ pub const Shell = struct {
                         // escape - cancel search
                         self.search_mode = false;
                         self.search_len = 0;
-                        std.debug.print("\r", .{});
+                        try self.stdout().writeByte('\r');
                         try self.printFancyPrompt();
                         if (pos > 0) {
-                            std.debug.print("{s}", .{buf[0..pos]});
+                            try self.stdout().writeAll(buf[0..pos]);
                         }
                         continue;
                     },
@@ -242,7 +251,7 @@ pub const Shell = struct {
                         // backspace in search
                         if (self.search_len > 0) {
                             self.search_len -= 1;
-                            std.debug.print("\x08 \x08", .{});
+                            try self.stdout().writeAll("\x08 \x08");
                         }
                     },
                     32...126 => {
@@ -250,7 +259,7 @@ pub const Shell = struct {
                         if (self.search_len < self.search_buffer.len - 1) {
                             self.search_buffer[self.search_len] = char;
                             self.search_len += 1;
-                            std.debug.print("{c}", .{char});
+                            try self.stdout().writeByte(char);
                         }
                     },
                     else => {
@@ -267,14 +276,14 @@ pub const Shell = struct {
                     switch (char) {
                         '\n' => {
                             // move to next line when user presses enter
-                            std.debug.print("\n", .{});
+                            try self.stdout().writeByte('\n');
                             buf[pos] = 0; // null terminate
                             const input = std.mem.trim(u8, buf[0..pos], " \t\n\r");
                             return input;
                         },
                         CTRL_C => {
                             // ctrl+c - clear line and start fresh
-                            std.debug.print("\n", .{});
+                            try self.stdout().writeByte('\n');
                             pos = 0;
                             self.cursor_pos = 0;
                             self.history_index = -1; // reset history navigation
@@ -290,19 +299,19 @@ pub const Shell = struct {
                                 self.vim_mode = .insert; // Reset to insert when enabling vim mode
                             }
                             // show mode change
-                            std.debug.print("\r", .{});
+                            try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();
                             // re-display current input
                             if (pos > 0) {
-                                std.debug.print("{s}", .{buf[0..pos]});
+                                try self.stdout().writeAll(buf[0..pos]);
                             }
                             continue;
                         },
                         CTRL_L => {
-                            std.debug.print("\x1b[2J\x1b[H", .{});
+                            try self.stdout().writeAll("\x1b[2J\x1b[H");
                             try self.printFancyPrompt();
                             if (pos > 0) {
-                                std.debug.print("{s}", .{buf[0..pos]});
+                                try self.stdout().writeAll(buf[0..pos]);
                             }
                             continue;
                         },
@@ -311,9 +320,9 @@ pub const Shell = struct {
                             const new_text = try self.handleTabCompletion(buf, pos) orelse continue;
                             defer self.allocator.free(new_text);
                             // clear current line and show completion
-                            std.debug.print("\r", .{});
+                            try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();
-                            std.debug.print("{s}", .{new_text});
+                            try self.stdout().writeAll(new_text);
                             // update buffer with completion
                             const copy_len = @min(new_text.len, buf.len - 1);
                             @memcpy(buf[0..copy_len], new_text[0..copy_len]);
@@ -324,13 +333,13 @@ pub const Shell = struct {
                             if (pos > 0) {
                                 pos -= 1;
                                 // move cursor back, print space to erase character, move cursor back again
-                                std.debug.print("\x08 \x08", .{});
+                                try self.stdout().writeAll("\x08 \x08");
                             }
                         },
                         32...126 => {
                             // echo printable characters (since we disabled terminal echo)
                             @branchHint(.likely);
-                            std.debug.print("{c}", .{char});
+                            try self.stdout().writeByte(char);
                             pos += 1;
                         },
                         else => {
@@ -344,7 +353,7 @@ pub const Shell = struct {
                         'h' => { // move cursor left
                             if (self.cursor_pos > 0) {
                                 self.cursor_pos -= 1;
-                                std.debug.print("\x1B[D", .{}); // move cursor left
+                                try self.stdout().writeAll("\x1B[D"); // move cursor left
                             }
                         },
                         'j' => { // move to previous command in history
@@ -363,11 +372,11 @@ pub const Shell = struct {
                             const input_end = self.findInputEnd(buf);
                             if (self.cursor_pos < input_end and self.cursor_pos < pos) {
                                 self.cursor_pos += 1;
-                                std.debug.print("\x1B[C", .{}); // move cursor right
+                                try self.stdout().writeAll("\x1B[C"); // move cursor right
                             }
                         },
                         '0' => { // move to beginning of line
-                            std.debug.print("\r", .{});
+                            try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();
                             self.cursor_pos = 0;
                         },
@@ -376,7 +385,7 @@ pub const Shell = struct {
                             const move_amount = input_end - self.cursor_pos;
                             if (move_amount > 0) {
                                 for (0..move_amount) |_| {
-                                    std.debug.print("\x1B[C", .{});
+                                    try self.stdout().writeAll("\x1B[C");
                                 }
                                 self.cursor_pos = input_end;
                             }
@@ -385,9 +394,7 @@ pub const Shell = struct {
                             const new_pos = self.jumpWordForward(buf, self.cursor_pos);
                             const move_amount = new_pos - self.cursor_pos;
                             if (move_amount > 0) {
-                                for (0..move_amount) |_| {
-                                    std.debug.print("\x1B[C", .{});
-                                }
+                                try self.stdout().print("\x1B[{d}C", .{move_amount});
                                 self.cursor_pos = new_pos;
                             }
                         },
@@ -395,29 +402,33 @@ pub const Shell = struct {
                             const new_pos = self.jumpWordBackward(buf, self.cursor_pos);
                             const move_amount = self.cursor_pos - new_pos;
                             if (move_amount > 0) {
-                                for (0..move_amount) |_| {
-                                    std.debug.print("\x1B[D", .{});
-                                }
+                                try self.stdout().print("\x1B[{d}D", .{move_amount});
+                                self.cursor_pos = new_pos;
+                            }
+                        },
+                        'B' => {
+                            const new_pos = self.jumpWordBackward(buf, self.cursor_pos);
+                            const move_amount = self.cursor_pos - new_pos;
+                            if (move_amount > 0) {
+                                try self.stdout().print("\x1B[{d}D", .{move_amount});
                                 self.cursor_pos = new_pos;
                             }
                         },
                         'i' => {
                             self.vim_mode = .insert;
                             // show mode change
-                            std.debug.print("\r", .{});
+                            try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();
                             // re-display current input
                             if (pos > 0) {
-                                std.debug.print("{s}", .{buf[0..pos]});
+                                try self.stdout().writeAll(buf[0..pos]);
                             }
                         },
                         'e' => { // move to end of word (vim standard)
                             const new_pos = self.jumpWordEndForward(buf, self.cursor_pos);
                             const move_amount = new_pos - self.cursor_pos;
                             if (move_amount > 0) {
-                                for (0..move_amount) |_| {
-                                    std.debug.print("\x1B[C", .{});
-                                }
+                                try self.stdout().print("\x1B[{d}C", .{move_amount});
                                 self.cursor_pos = new_pos;
                             }
                         },
@@ -425,9 +436,7 @@ pub const Shell = struct {
                             const new_pos = self.jumpWORDEndForward(buf, self.cursor_pos);
                             const move_amount = new_pos - self.cursor_pos;
                             if (move_amount > 0) {
-                                for (0..move_amount) |_| {
-                                    std.debug.print("\x1B[C", .{});
-                                }
+                                try self.stdout().print("\x1B[{d}C", .{move_amount});
                                 self.cursor_pos = new_pos;
                             }
                         },
@@ -437,17 +446,17 @@ pub const Shell = struct {
                                 self.vim_mode = .insert; // Reset to insert when enabling vim mode
                             }
                             // show mode change
-                            std.debug.print("\r", .{});
+                            try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();
                             // re-display current input
                             if (pos > 0) {
-                                std.debug.print("{s}", .{buf[0..pos]});
+                                try self.stdout().writeAll(buf[0..pos]);
                             }
                         },
                         'a' => { // append after cursor
                             if (self.cursor_pos < pos) {
                                 self.cursor_pos += 1;
-                                std.debug.print("\x1B[C", .{});
+                                try self.stdout().writeAll("\x1B[C");
                             }
                             self.vim_mode = .insert;
                         },
@@ -456,14 +465,14 @@ pub const Shell = struct {
                             const move_amount = input_end - self.cursor_pos;
                             if (move_amount > 0) {
                                 for (0..move_amount) |_| {
-                                    std.debug.print("\x1B[C", .{});
+                                    try self.stdout().writeAll("\x1B[C");
                                 }
                                 self.cursor_pos = input_end;
                             }
                             self.vim_mode = .insert;
                         },
                         'I' => { // insert at beginning of line
-                            std.debug.print("\r", .{});
+                            try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();
                             self.cursor_pos = 0;
                             self.vim_mode = .insert;
@@ -549,16 +558,16 @@ pub const Shell = struct {
                         'u' => { // undo (simplified - just clear line)
                             pos = 0;
                             self.cursor_pos = 0;
-                            std.debug.print("\r", .{});
+                            try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();
                         },
                         '/' => { // forward search
-                            std.debug.print("/", .{});
+                            try self.stdout().writeByte('/');
                             self.search_mode = true;
                             self.search_len = 0;
                         },
                         '?' => { // backward search
-                            std.debug.print("?", .{});
+                            try self.stdout().writeByte('?');
                             self.search_mode = true;
                             self.search_len = 0;
                         },
@@ -573,7 +582,7 @@ pub const Shell = struct {
                             try self.redrawLine(buf, self.cursor_pos);
                         },
                         CTRL_C => { // ctrl+c in normal mode - clear line and return to insert
-                            std.debug.print("\n", .{});
+                            try self.stdout().writeByte('\n');
                             pos = 0;
                             self.cursor_pos = 0;
                             self.history_index = -1; // reset history navigation
@@ -582,7 +591,7 @@ pub const Shell = struct {
                             try self.printFancyPrompt();
                         },
                         '\n' => {
-                            std.debug.print("\n", .{});
+                            try self.stdout().writeByte('\n');
                             buf[pos] = 0; // null terminate
                             const input = std.mem.trim(u8, buf[0..pos], " \t\n\r");
                             // return to insert mode for next command
@@ -700,7 +709,7 @@ pub const Shell = struct {
         if (pos == 0) return;
 
         const current_input = buf[0..pos];
-        std.debug.print("\n{s}--- available completions ---{s}\n", .{ Colors.bold, Colors.reset });
+        try self.stdout().print("\n{s}--- available completions ---{s}\n", .{ Colors.bold, Colors.reset });
 
         if (std.mem.indexOf(u8, current_input, " ")) |_| {
             // show file completions
@@ -710,24 +719,22 @@ pub const Shell = struct {
             try self.showCommandCompletions(current_input);
         }
 
-        std.debug.print("{s}-------------------------------{s}\n", .{ Colors.bold, Colors.reset });
+        try self.stdout().print("{s}-------------------------------{s}\n", .{ Colors.bold, Colors.reset });
         try self.printFancyPrompt();
-        std.debug.print("{s}", .{current_input});
+        try self.stdout().writeAll(current_input);
     }
 
     fn showCommandCompletions(self: *Self, input: []const u8) !void {
-        _ = self;
         const builtin_commands = [_][]const u8{ "pwd", "echo", "cd", "exit", "history", "search", "vimode" };
 
         for (builtin_commands) |cmd| {
             if (std.mem.startsWith(u8, cmd, input)) {
-                std.debug.print("  {s}{s}{s}\n", .{ Colors.userhost, cmd, Colors.reset });
+                try self.stdout().print("  {s}{s}{s}\n", .{ Colors.userhost, cmd, Colors.reset });
             }
         }
     }
 
     fn showFileCompletions(self: *Self, input: []const u8) !void {
-        _ = self;
         if (std.mem.lastIndexOf(u8, input, " ")) |last_space| {
             const file_part = input[last_space + 1 ..];
             const only_dirs = std.mem.startsWith(u8, input, "cd ");
@@ -747,7 +754,7 @@ pub const Shell = struct {
                         else => Colors.default_color,
                     };
                     const suffix = if (entry.kind == .directory) "/" else "";
-                    std.debug.print("  {s}{s}{s}{s}\n", .{ file_color, entry.name, suffix, Colors.reset });
+                    try self.stdout().print("  {s}{s}{s}{s}\n", .{ file_color, entry.name, suffix, Colors.reset });
                 }
             }
         }
@@ -882,14 +889,14 @@ pub const Shell = struct {
     // Helper functions for cursor movement to reduce code duplication
     fn moveCursorRight(self: *Self, count: usize) void {
         for (0..count) |_| {
-            std.debug.print("\x1B[C", .{});
+            try self.stdout().writeAll("\x1B[C");
         }
         self.cursor_pos += count;
     }
 
     fn moveCursorLeft(self: *Self, count: usize) void {
         for (0..count) |_| {
-            std.debug.print("\x1B[D", .{});
+            try self.stdout().writeAll("\x1B[D");
         }
         if (self.cursor_pos >= count) {
             self.cursor_pos -= count;
@@ -902,17 +909,17 @@ pub const Shell = struct {
         const input_len = @min(self.findInputEnd(buf), cursor_pos);
 
         // clear current line and redraw prompt + input
-        std.debug.print("\r\x1b[2K", .{});
+        try self.stdout().writeAll("\r\x1b[2K");
         try self.printFancyPrompt();
 
         if (input_len > 0) {
-            std.debug.print("{s}", .{buf[0..input_len]});
+            try self.stdout().writeAll(buf[0..input_len]);
         }
 
         // position cursor at the right place
         if (cursor_pos < input_len) {
             const back_chars = input_len - cursor_pos;
-            std.debug.print("\x1b[{d}D", .{back_chars});
+            try self.stdout().print("\x1b[{d}D", .{back_chars});
         }
     }
 
@@ -1054,6 +1061,7 @@ pub const Shell = struct {
         self.allocator.free(self.current_command);
         self.allocator.free(self.clipboard);
         self.allocator.free(self.search_buffer);
+        self.allocator.free(self.stdout().buffer);
         self.allocator.destroy(self);
     }
 
@@ -1144,6 +1152,7 @@ pub const Shell = struct {
 
         // Print initial prompt
         try self.printFancyPrompt();
+        try self.stdout().flush();
 
         while (self.running) {
             // enhanced input handling with vim mode support
@@ -1163,6 +1172,7 @@ pub const Shell = struct {
                     try self.printFancyPrompt();
                 }
             }
+            self.stdout().flush() catch unreachable;
         }
     }
 
@@ -1381,12 +1391,12 @@ pub const Shell = struct {
                 } else {
                     // Valid variable name - store in shell variables (for now)
                     const name_copy = self.allocator.dupe(u8, name) catch {
-                        std.debug.print("zish: assignment failed: out of memory\n", .{});
+                        try self.stdout().writeAll("zish: assignment failed: out of memory\n");
                         return 1;
                     };
                     const value_copy = self.allocator.dupe(u8, value) catch {
                         self.allocator.free(name_copy);
-                        std.debug.print("zish: assignment failed: out of memory\n", .{});
+                        try self.stdout().writeAll("zish: assignment failed: out of memory\n");
                         return 1;
                     };
 
@@ -1398,7 +1408,7 @@ pub const Shell = struct {
                     self.variables.put(name_copy, value_copy) catch {
                         self.allocator.free(name_copy);
                         self.allocator.free(value_copy);
-                        std.debug.print("zish: assignment failed: out of memory\n", .{});
+                        try self.stdout().writeAll("zish: assignment failed: out of memory\n");
                         return 1;
                     };
                     return 0;
@@ -1414,24 +1424,24 @@ pub const Shell = struct {
 
         if (std.mem.startsWith(u8, expanded_command, "echo ")) {
             const msg = expanded_command[5..];
-            std.debug.print("{s}\n", .{msg});
+            try self.stdout().print("{s}\n", .{msg});
             return 0;
         }
 
         if (std.mem.eql(u8, expanded_command, "pwd")) {
             var buf: [4096]u8 = undefined;
             const cwd = try std.posix.getcwd(&buf);
-            std.debug.print("{s}\n", .{cwd});
+            try self.stdout().print("{s}\n", .{cwd});
             return 0;
         }
 
         if (std.mem.eql(u8, expanded_command, "vimode")) {
             self.vim_mode_enabled = !self.vim_mode_enabled;
             if (self.vim_mode_enabled) {
-                std.debug.print("Vi mode enabled\n", .{});
+                try self.stdout().writeAll("Vi mode enabled\n");
                 self.vim_mode = .insert; // Reset to insert mode when enabling
             } else {
-                std.debug.print("Vi mode disabled (Emacs-like editing)\n", .{});
+                try self.stdout().writeAll("Vi mode disabled (Emacs-like editing)\n");
             }
             return 0;
         }
@@ -1445,26 +1455,26 @@ pub const Shell = struct {
 
             if (std.mem.startsWith(u8, path, "~")) {
                 const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch {
-                    std.debug.print("cd: ~: could not get HOME directory\n", .{});
+                    try self.stdout().writeAll("cd: ~: could not get HOME directory\n");
                     return 1;
                 };
                 defer self.allocator.free(home);
 
                 if (std.mem.eql(u8, path, "~")) {
                     final_path = std.fmt.bufPrint(&expanded_path_buf, "{s}", .{home}) catch {
-                        std.debug.print("cd: path too long\n", .{});
+                        try self.stdout().writeAll("cd: path too long\n");
                         return 1;
                     };
                 } else if (std.mem.startsWith(u8, path, "~/")) {
                     final_path = std.fmt.bufPrint(&expanded_path_buf, "{s}{s}", .{ home, path[1..] }) catch {
-                        std.debug.print("cd: path too long\n", .{});
+                        try self.stdout().writeAll("cd: path too long\n");
                         return 1;
                     };
                 }
             }
 
             std.posix.chdir(final_path) catch |err| {
-                std.debug.print("cd: {s}: {}\n", .{ final_path, err });
+                try self.stdout().print("cd: {s}: {}\n", .{ final_path, err });
                 return 1;
             };
             return 0;
@@ -1473,7 +1483,7 @@ pub const Shell = struct {
         if (std.mem.eql(u8, command, "history")) {
             if (self.hist) |h| {
                 const stats = h.getStats();
-                std.debug.print("history: {} entries ({} unique)\n", .{ stats.total, stats.unique });
+                try self.stdout().print("history: {} entries ({} unique)\n", .{ stats.total, stats.unique });
 
                 // show recent commands
                 var count: usize = 0;
@@ -1483,10 +1493,10 @@ pub const Shell = struct {
                     count += 1;
                     const entry = h.entries.items[i];
                     const cmd = h.getCommand(entry);
-                    std.debug.print("  {}: {s} (exit: {})\n", .{ count, cmd, entry.exit_code });
+                    try self.stdout().print("  {}: {s} (exit: {})\n", .{ count, cmd, entry.exit_code });
                 }
             } else {
-                std.debug.print("history not available\n", .{});
+                try self.stdout().writeAll("history not available\n");
             }
             return 0;
         }
@@ -1497,14 +1507,14 @@ pub const Shell = struct {
                 const matches = try h.fuzzySearch(query, self.allocator);
                 defer self.allocator.free(matches);
 
-                std.debug.print("fuzzy search results for '{s}':\n", .{query});
+                try self.stdout().print("fuzzy search results for '{s}':\n", .{query});
                 for (matches[0..@min(matches.len, 10)]) |match| {
                     const entry = h.entries.items[match.entry_index];
                     const cmd = h.getCommand(entry);
-                    std.debug.print("  {}: {s}\n", .{ @as(u32, @intFromFloat(match.score)), cmd });
+                    try self.stdout().print("  {}: {s}\n", .{ @as(u32, @intFromFloat(match.score)), cmd });
                 }
             } else {
-                std.debug.print("history not available\n", .{});
+                try self.stdout().writeAll("history not available\n");
             }
             return 0;
         }
@@ -1556,7 +1566,7 @@ pub const Shell = struct {
 
         const term = child.spawnAndWait() catch |err| switch (err) {
             error.FileNotFound => {
-                std.debug.print("zish: {s}: command not found\n", .{args.items[0]});
+                try self.stdout().print("zish: {s}: command not found\n", .{args.items[0]});
                 return 127;
             },
             else => return err,

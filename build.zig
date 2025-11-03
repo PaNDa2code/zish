@@ -27,11 +27,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zish", .module = mod },
-                .{ .name = "clap", .module = clap.module("clap") },
-            },
         }),
+    });
+
+    exe.root_module.addImport("clap", clap.module("clap"));
+
+    exe.root_module.addAnonymousImport("build.zig.zon", .{
+        .root_source_file = b.path("build.zig.zon"),
     });
 
     // Enable performance optimizations
@@ -50,10 +52,6 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_simd", enable_simd);
     build_options.addOption(bool, "profile_guided", profile_guided);
     build_options.addOption(bool, "release_build", optimize != .Debug);
-
-    // Version from build.zig.zon - in a proper setup this would be auto-generated
-    // For now we keep it simple since the build system will handle version sync
-    build_options.addOption([]const u8, "version", "0.2.2");
 
     exe.root_module.addOptions("build_options", build_options);
 

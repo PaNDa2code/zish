@@ -4,6 +4,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const lexer = @import("lexer.zig");
 const history = @import("history.zig");
+const tty = @import("tty.zig");
 
 const VimMode = enum {
     insert,
@@ -23,17 +24,11 @@ const EscapeResult = struct {
 
 // ansi color codes for zsh-like colorful prompt
 const Colors = struct {
-    const reset = "\x1b[0m";
-    const bold = "\x1b[1m";
-
-    // vim mode indicators
-    const insert_mode = "\x1b[33m"; // yellow
-    const normal_mode = "\x1b[31m"; // red
-
-    // prompt elements
-    const userhost = "\x1b[32m"; // green for user@host
-    const path = "\x1b[36m"; // turquoise/cyan for all paths
-    const default_color = "\x1b[39m"; // default terminal color
+    const default_color = tty.Color.reset;
+    const path = tty.Color.cyan;
+    const userhost = tty.Color.green;
+    const normal_mode = tty.Color.red;
+    const insert_mode = tty.Color.yellow;
 };
 
 // Control character constants for better readability
@@ -81,7 +76,7 @@ pub const Shell = struct {
         const clipboard_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
         const search_buffer = try allocator.alloc(u8, 256); // search queries are usually short
 
-        const writer_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH * 2);
+        const writer_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH + types.MAX_PROMET_LENGHT);
 
         shell.* = .{
             .allocator = allocator,
@@ -152,8 +147,8 @@ pub const Shell = struct {
         // print colorful zsh-like prompt
         const effective_mode = if (self.vim_mode_enabled) self.vim_mode else .insert;
         const mode_color = switch (effective_mode) {
-            .insert => Colors.insert_mode,
-            .normal => Colors.normal_mode,
+            .insert => tty.Color.yellow,
+            .normal => tty.Color.red,
         };
         const mode_indicator = if (self.vim_mode_enabled) switch (effective_mode) {
             .insert => "I",
@@ -161,15 +156,15 @@ pub const Shell = struct {
         } else "E"; // E for emacs/normal editing mode
 
         // mild colorful prompt: [mode] user@host ~/path $
-        try self.stdout().print("{s}[{s}{s}{s}] {s}{s}@{s}{s} {s}{s}{s} $ ", .{
-            Colors.bold,     mode_color,   mode_indicator, Colors.reset,
-            Colors.userhost, user,         hostname,       Colors.reset,
-            Colors.path,     display_path, Colors.reset,
+        try self.stdout().print("{f}[{f}{s}{f}] {f}{s}@{s}{f} {f}{s}{f} $ ", .{
+            tty.Style.bold,  mode_color,   mode_indicator,  tty.Color.reset,
+            Colors.userhost, user,         hostname,        tty.Color.reset,
+            Colors.path,     display_path, tty.Color.reset,
         });
     }
 
     fn readInputWithVim(self: *Self, buf: *[types.MAX_COMMAND_LENGTH]u8) !?[]const u8 {
-        const stdin = std.fs.File{ .handle = 0 };
+        const stdin = std.fs.File.stdin();
         var pos: usize = 0;
         self.cursor_pos = 0;
 
@@ -709,7 +704,7 @@ pub const Shell = struct {
         if (pos == 0) return;
 
         const current_input = buf[0..pos];
-        try self.stdout().print("\n{s}--- available completions ---{s}\n", .{ Colors.bold, Colors.reset });
+        try self.stdout().print("\n{f}--- available completions ---{f}\n", .{ tty.Style.bold, tty.Color.reset });
 
         if (std.mem.indexOf(u8, current_input, " ")) |_| {
             // show file completions
@@ -719,7 +714,7 @@ pub const Shell = struct {
             try self.showCommandCompletions(current_input);
         }
 
-        try self.stdout().print("{s}-------------------------------{s}\n", .{ Colors.bold, Colors.reset });
+        try self.stdout().print("{f}-------------------------------{f}\n", .{ tty.Style.bold, tty.Color.reset });
         try self.printFancyPrompt();
         try self.stdout().writeAll(current_input);
     }
@@ -729,7 +724,7 @@ pub const Shell = struct {
 
         for (builtin_commands) |cmd| {
             if (std.mem.startsWith(u8, cmd, input)) {
-                try self.stdout().print("  {s}{s}{s}\n", .{ Colors.userhost, cmd, Colors.reset });
+                try self.stdout().print("  {f}{s}{f}\n", .{ Colors.userhost, cmd, tty.Color.reset });
             }
         }
     }
@@ -754,7 +749,7 @@ pub const Shell = struct {
                         else => Colors.default_color,
                     };
                     const suffix = if (entry.kind == .directory) "/" else "";
-                    try self.stdout().print("  {s}{s}{s}{s}\n", .{ file_color, entry.name, suffix, Colors.reset });
+                    try self.stdout().print("  {f}{s}{s}{f}\n", .{ file_color, entry.name, suffix, tty.Color.reset });
                 }
             }
         }

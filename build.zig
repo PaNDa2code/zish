@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .use_llvm = true,
     });
 
     exe.root_module.addImport("clap", clap.module("clap"));

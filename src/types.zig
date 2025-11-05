@@ -11,6 +11,11 @@ pub const MAX_ARGS_COUNT = 256;
 pub const MAX_ENV_VALUE_LENGTH = 4096;
 pub const MAX_PARSE_DEPTH = 64;
 
+pub const MAX_PROMET_LENGHT =
+    std.fs.max_path_bytes +
+    std.fs.max_name_bytes +
+    std.posix.HOST_NAME_MAX + 265;
+
 // secure integer types to prevent overflow
 pub const LineNumber = u32;
 pub const ColumnNumber = u32;
@@ -19,10 +24,10 @@ pub const RecursionDepth = u8;
 
 // capability-based permissions
 pub const EnvironmentCapability = enum {
-    ReadUserInfo,    // home, user
-    ReadLocale,      // lang, lc_all
-    ReadTerminal,    // term
-    ReadPath,        // path (restricted)
+    ReadUserInfo, // home, user
+    ReadLocale, // lang, lc_all
+    ReadTerminal, // term
+    ReadPath, // path (restricted)
 };
 
 pub const ExecutionCapability = enum {

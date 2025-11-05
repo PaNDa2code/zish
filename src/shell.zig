@@ -15,11 +15,14 @@ const EscapeAction = enum {
     continue_loop,
     set_position,
     switch_to_normal,
+    switch_to_insert,
 };
 
-const EscapeResult = struct {
-    action: EscapeAction,
-    new_pos: usize = 0,
+const EscapeResult = union(EscapeAction) {
+    continue_loop,
+    set_position: usize,
+    switch_to_normal,
+    switch_to_insert,
 };
 
 // ansi color codes for zsh-like colorful prompt
@@ -187,14 +190,23 @@ pub const Shell = struct {
             // handle escape sequences
             if (char == ESC) {
                 const escape_result = try self.handleEscapeSequence(&stdin, buf, pos);
-                switch (escape_result.action) {
+                switch (escape_result) {
                     .continue_loop => continue,
-                    .set_position => {
-                        pos = escape_result.new_pos;
+                    .set_position => |p| {
+                        pos = p;
                         continue;
                     },
                     .switch_to_normal => {
                         self.vim_mode = .normal;
+                        try self.stdout().writeByte('\r');
+                        try self.printFancyPrompt();
+                        if (pos > 0) {
+                            try self.stdout().writeAll(buf[0..pos]);
+                        }
+                        continue;
+                    },
+                    .switch_to_insert => {
+                        self.vim_mode = .insert;
                         try self.stdout().writeByte('\r');
                         try self.printFancyPrompt();
                         if (pos > 0) {
@@ -939,46 +951,46 @@ pub const Shell = struct {
 
             // If no second byte or not '[', this is a plain Escape - switch to normal mode
             if (second_byte == 0 or temp_buf[0] != '[') {
-                return EscapeResult{ .action = .switch_to_normal };
+                return EscapeResult.switch_to_normal;
             }
         } else {
             // read '[' for escape sequences
-            const second_byte = stdin.read(&temp_buf) catch return EscapeResult{ .action = .continue_loop };
+            const second_byte = stdin.read(&temp_buf) catch return EscapeResult.continue_loop;
             if (second_byte == 0 or temp_buf[0] != '[') {
-                return EscapeResult{ .action = .continue_loop };
+                return EscapeResult.continue_loop;
             }
         }
 
         // read the command byte
-        const third_byte = stdin.read(&temp_buf) catch return EscapeResult{ .action = .continue_loop };
-        if (third_byte == 0) return EscapeResult{ .action = .continue_loop };
+        const third_byte = stdin.read(&temp_buf) catch return EscapeResult.continue_loop;
+        if (third_byte == 0) return EscapeResult.continue_loop;
 
         return switch (temp_buf[0]) {
             'Z' => blk: {
                 if (self.vim_mode == .insert) {
                     try self.handleShiftTab(buf, pos);
                 }
-                break :blk EscapeResult{ .action = .continue_loop };
+                break :blk EscapeResult.continue_loop;
             },
             'A' => blk: {
                 if (self.vim_mode == .insert) {
                     const new_pos = try self.handleUpArrow(buf, pos);
                     try self.redrawLine(buf, new_pos);
-                    break :blk EscapeResult{ .action = .set_position, .new_pos = new_pos };
+                    break :blk EscapeResult{ .set_position = new_pos };
                 }
-                break :blk EscapeResult{ .action = .continue_loop };
+                break :blk EscapeResult.continue_loop;
             },
             'B' => blk: {
                 if (self.vim_mode == .insert) {
                     const new_pos = try self.handleDownArrow(buf, pos);
                     try self.redrawLine(buf, new_pos);
-                    break :blk EscapeResult{ .action = .set_position, .new_pos = new_pos };
+                    break :blk EscapeResult{ .set_position = new_pos };
                 }
-                break :blk EscapeResult{ .action = .continue_loop };
+                break :blk EscapeResult.continue_loop;
             },
-            'C', 'D' => EscapeResult{ .action = .continue_loop }, // ignore basic arrows for now
+            'C', 'D' => EscapeResult.continue_loop, // ignore basic arrows for now
             '1' => try self.handleCtrlArrows(stdin, buf, pos),
-            else => EscapeResult{ .action = .continue_loop },
+            else => EscapeResult.continue_loop,
         };
     }
 
@@ -986,40 +998,40 @@ pub const Shell = struct {
         var temp_buf: [1]u8 = undefined;
 
         // expect ';'
-        const semicolon = stdin.read(&temp_buf) catch return EscapeResult{ .action = .continue_loop };
-        if (semicolon == 0 or temp_buf[0] != ';') return EscapeResult{ .action = .continue_loop };
+        const semicolon = stdin.read(&temp_buf) catch return EscapeResult.continue_loop;
+        if (semicolon == 0 or temp_buf[0] != ';') return EscapeResult.continue_loop;
 
         // expect '5'
-        const five = stdin.read(&temp_buf) catch return EscapeResult{ .action = .continue_loop };
-        if (five == 0 or temp_buf[0] != '5') return EscapeResult{ .action = .continue_loop };
+        const five = stdin.read(&temp_buf) catch return EscapeResult.continue_loop;
+        if (five == 0 or temp_buf[0] != '5') return EscapeResult.continue_loop;
 
         // read direction
-        const direction = stdin.read(&temp_buf) catch return EscapeResult{ .action = .continue_loop };
-        if (direction == 0) return EscapeResult{ .action = .continue_loop };
+        const direction = stdin.read(&temp_buf) catch return EscapeResult.continue_loop;
+        if (direction == 0) return EscapeResult.continue_loop;
 
-        if (self.vim_mode != .insert) return EscapeResult{ .action = .continue_loop };
+        if (self.vim_mode != .insert) return EscapeResult.continue_loop;
 
         return switch (temp_buf[0]) {
             'C' => blk: { // ctrl+right
                 const new_pos = self.jumpWordForward(buf, pos);
                 try self.redrawLine(buf, new_pos);
-                break :blk EscapeResult{ .action = .set_position, .new_pos = new_pos };
+                break :blk EscapeResult{ .set_position = new_pos };
             },
             'D' => blk: { // ctrl+left
                 const new_pos = self.jumpWordBackward(buf, pos);
                 try self.redrawLine(buf, new_pos);
-                break :blk EscapeResult{ .action = .set_position, .new_pos = new_pos };
+                break :blk EscapeResult{ .set_position = new_pos };
             },
             'A' => blk: { // ctrl+up - beginning of line
                 try self.redrawLine(buf, 0);
-                break :blk EscapeResult{ .action = .set_position, .new_pos = 0 };
+                break :blk EscapeResult{ .set_position = 0 };
             },
             'B' => blk: { // ctrl+down - end of line
                 const new_pos = self.findInputEnd(buf);
                 try self.redrawLine(buf, new_pos);
-                break :blk EscapeResult{ .action = .set_position, .new_pos = new_pos };
+                break :blk EscapeResult{ .set_position = new_pos };
             },
-            else => EscapeResult{ .action = .continue_loop },
+            else => EscapeResult.continue_loop,
         };
     }
 
@@ -1166,8 +1178,8 @@ pub const Shell = struct {
                 if (self.running) {
                     try self.printFancyPrompt();
                 }
+                self.stdout().flush() catch unreachable;
             }
-            self.stdout().flush() catch unreachable;
         }
     }
 

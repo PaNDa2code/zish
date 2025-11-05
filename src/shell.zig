@@ -14,15 +14,13 @@ const VimMode = enum {
 const EscapeAction = enum {
     continue_loop,
     set_position,
-    switch_to_normal,
-    switch_to_insert,
+    toggle_vim_mode,
 };
 
 const EscapeResult = union(EscapeAction) {
     continue_loop,
     set_position: usize,
-    switch_to_normal,
-    switch_to_insert,
+    toggle_vim_mode,
 };
 
 // ansi color codes for zsh-like colorful prompt
@@ -196,17 +194,8 @@ pub const Shell = struct {
                         pos = p;
                         continue;
                     },
-                    .switch_to_normal => {
-                        self.vim_mode = .normal;
-                        try self.stdout().writeByte('\r');
-                        try self.printFancyPrompt();
-                        if (pos > 0) {
-                            try self.stdout().writeAll(buf[0..pos]);
-                        }
-                        continue;
-                    },
-                    .switch_to_insert => {
-                        self.vim_mode = .insert;
+                    .toggle_vim_mode => {
+                        self.vim_mode = if (self.vim_mode == .normal) .insert else .normal;
                         try self.stdout().writeByte('\r');
                         try self.printFancyPrompt();
                         if (pos > 0) {
@@ -936,61 +925,57 @@ pub const Shell = struct {
         buf: *[types.MAX_COMMAND_LENGTH]u8,
         pos: usize,
     ) !EscapeResult {
-        var temp_buf: [1]u8 = undefined;
+        var temp_buf: [2]u8 = undefined;
 
-        // For vim mode: if we're in insert mode, try to detect plain Escape vs escape sequences
-        if (self.vim_mode_enabled and self.vim_mode == .insert) {
-            // Set stdin to non-blocking mode to check if there's more data
-            const flags = std.posix.fcntl(stdin.handle, std.posix.F.GETFL, 0) catch 0;
-            _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags | 0o4000) catch {}; // O_NONBLOCK = 0o4000 on Linux
+        // If there is an ESC sequence, the terminal emulator will have already piped
+        // all the sequence bytes into stdin. If not, the read will return 0 bytes,
+        // indicating this is a normal ESC key press.
 
-            const second_byte = stdin.read(&temp_buf) catch 0;
+        // Set stdin to non-blocking mode to check if there's more data
+        const flags = std.posix.fcntl(stdin.handle, std.posix.F.GETFL, 0) catch 0;
+        _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags | 0o4000) catch {}; // O_NONBLOCK = 0o4000 on Linux
 
-            // Restore blocking mode
-            _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags) catch {};
+        const readed_bytes = stdin.read(&temp_buf) catch 0;
 
-            // If no second byte or not '[', this is a plain Escape - switch to normal mode
-            if (second_byte == 0 or temp_buf[0] != '[') {
-                return EscapeResult.switch_to_normal;
-            }
-        } else {
-            // read '[' for escape sequences
-            const second_byte = stdin.read(&temp_buf) catch return EscapeResult.continue_loop;
-            if (second_byte == 0 or temp_buf[0] != '[') {
-                return EscapeResult.continue_loop;
-            }
+        // Restore blocking mode
+        _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags) catch {};
+
+        if (readed_bytes == 0 or temp_buf[0] != '[') {
+            return if (self.vim_mode_enabled)
+                .toggle_vim_mode
+            else
+                .continue_loop;
         }
 
         // read the command byte
-        const third_byte = stdin.read(&temp_buf) catch return EscapeResult.continue_loop;
-        if (third_byte == 0) return EscapeResult.continue_loop;
+        if (readed_bytes == 1) return .continue_loop;
 
-        return switch (temp_buf[0]) {
+        return switch (temp_buf[1]) {
             'Z' => blk: {
                 if (self.vim_mode == .insert) {
                     try self.handleShiftTab(buf, pos);
                 }
-                break :blk EscapeResult.continue_loop;
+                break :blk .continue_loop;
             },
             'A' => blk: {
                 if (self.vim_mode == .insert) {
                     const new_pos = try self.handleUpArrow(buf, pos);
                     try self.redrawLine(buf, new_pos);
-                    break :blk EscapeResult{ .set_position = new_pos };
+                    break :blk .{ .set_position = new_pos };
                 }
-                break :blk EscapeResult.continue_loop;
+                break :blk .continue_loop;
             },
             'B' => blk: {
                 if (self.vim_mode == .insert) {
                     const new_pos = try self.handleDownArrow(buf, pos);
                     try self.redrawLine(buf, new_pos);
-                    break :blk EscapeResult{ .set_position = new_pos };
+                    break :blk .{ .set_position = new_pos };
                 }
-                break :blk EscapeResult.continue_loop;
+                break :blk .continue_loop;
             },
-            'C', 'D' => EscapeResult.continue_loop, // ignore basic arrows for now
+            'C', 'D' => .continue_loop, // ignore basic arrows for now
             '1' => try self.handleCtrlArrows(stdin, buf, pos),
-            else => EscapeResult.continue_loop,
+            else => .continue_loop,
         };
     }
 

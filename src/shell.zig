@@ -64,6 +64,8 @@ pub const Shell = struct {
 
     stdout_writer: std.fs.File.Writer,
 
+    log_file: ?std.fs.File = null,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -170,6 +172,37 @@ pub const Shell = struct {
         self.cursor_pos = 0;
 
         while (pos < buf.len - 1) {
+            if (self.log_file) |file| {
+                var buff: [1024 * 256]u8 = undefined;
+                // zig fmt: off
+                const slice = try std.fmt.bufPrint(
+                    buff[0..],
+                    "\x1b[H\x1b[J" ++
+                        "State:\n" ++
+                        "  pos: {}\n" ++
+                        "  cursor_pos: {}\n" ++
+                        "  vim_mode: {s}\n" ++
+                        "  vim_mode_enabled: {}\n" ++
+                        "  history_index: {}\n" ++
+                        "  current_command_len: {}\n" ++
+                        "  clipboard_len: {}\n" ++
+                        "  search_mode: {}\n" ++
+                        "  search_len: {}\n" ++
+                        "  current_input: '{s}'\n" ++
+                        "  current_command: '{s}'\n" ++
+                        "  search_buffer: '{s}'\n",
+                    .{
+                        pos,                   self.cursor_pos,    @tagName(self.vim_mode),
+                        self.vim_mode_enabled, self.history_index, self.current_command_len,
+                        self.clipboard_len,    self.search_mode,   self.search_len,
+                        buf[0..pos], self.current_command[0..self.current_command_len],
+                        self.search_buffer[0..self.search_len],
+                    },
+                );
+                try file.writeAll(slice);
+                // zig fmt: on
+            }
+
             const bytes_read = stdin.read(buf[pos .. pos + 1]) catch |err| {
                 try self.stdout().print("input error: {}\n", .{err});
                 self.running = false;
@@ -412,6 +445,7 @@ pub const Shell = struct {
                         },
                         'i' => {
                             self.vim_mode = .insert;
+                            pos = self.cursor_pos;
                             // show mode change
                             try self.stdout().writeByte('\r');
                             try self.printFancyPrompt();

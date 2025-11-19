@@ -61,6 +61,12 @@ const InsertAtPosition = enum {
     line_end,
 };
 
+const VimModeAction = union(enum) {
+    toggle_enabled,
+    toggle_mode,
+    set_mode: VimMode,
+};
+
 const Action = union(enum) {
     none,
     cancel,
@@ -68,8 +74,7 @@ const Action = union(enum) {
     execute_command,
     redraw_line,
     clear_screen,
-    set_vim_mode: VimMode,
-    toggle_vim_mode,
+    vim_mode: VimModeAction,
     input_char: u8,
     backspace,
     delete: DeleteAction,
@@ -462,18 +467,17 @@ fn handleAction(self: *Shell, action: Action) !void {
             }
         },
 
-        .set_vim_mode => |mode| {
-            self.vim_mode = mode;
-            if (mode == .insert) {
-                // When entering insert mode, cursor stays at current position
-                self.cursor_pos = self.cursor_pos;
+        .vim_mode => |mode_action| {
+            switch (mode_action) {
+                .set_mode => |mode| self.vim_mode = mode,
+                .toggle_enabled => {
+                    self.vim_mode_enabled = !self.vim_mode_enabled;
+                },
+                .toggle_mode => {
+                    self.vim_mode = if (self.vim_mode == .normal) .insert else .normal;
+                },
             }
-            try self.redrawLine();
-        },
-
-        .toggle_vim_mode => {
-            self.vim_mode = if (self.vim_mode == .normal) .insert else .normal;
-            try self.redrawLine();
+            return self.redrawLine();
         },
 
         .tap_complete => {
@@ -667,7 +671,7 @@ fn insertModeAction(char: u8) Action {
     return switch (char) {
         '\n' => .execute_command,
         CTRL_C => .cancel,
-        CTRL_T => .toggle_vim_mode,
+        CTRL_T => .{ .vim_mode = .toggle_enabled },
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
         '\t' => .tap_complete,
@@ -691,7 +695,7 @@ fn normalModeAction(char: u8) Action {
         'j' => .{ .history_nav = .down },
         'k' => .{ .history_nav = .up },
 
-        'i' => .{ .set_vim_mode = .insert },
+        'i' => .{ .vim_mode = .{ .set_mode = .insert } },
 
         'a' => .{ .insert_at_position = .after_cursor },
         'A' => .{ .insert_at_position = .line_end },
@@ -713,7 +717,7 @@ fn normalModeAction(char: u8) Action {
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
-        CTRL_T => .toggle_vim_mode,
+        CTRL_T => .{ .vim_mode = .toggle_enabled },
 
         else => .none,
     };
@@ -734,7 +738,7 @@ fn escapeSequenceAction() !Action {
 
     // If no following bytes or not '[', it's just ESC key press
     if (bytes_read == 0 or temp_buf[0] != '[') {
-        return .toggle_vim_mode;
+        return .{ .vim_mode = .{ .set_mode = .normal } };
     }
 
     // Need at least 2 bytes for a valid escape sequence

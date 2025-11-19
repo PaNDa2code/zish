@@ -32,7 +32,8 @@ const MoveCursorAction = union(enum) {
     to_line_start,
     to_line_end,
 
-    to_word_boundary: WordBoundary,
+    word_forward: WordBoundary,
+    word_backward: WordBoundary,
 
     relative: isize,
     absolute: usize,
@@ -618,7 +619,8 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
         .absolute => |pos| @min(pos, max_pos),
         .to_line_start => 0,
         .to_line_end => max_pos,
-        .to_word_boundary => 0,
+        .word_forward => |boundary| self.findWordForward(boundary),
+        .word_backward => |boundary| self.findWordBackward(boundary),
     };
 
     if (new_pos == old_pos) return;
@@ -637,6 +639,93 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
         // left
         try self.stdout().print("\x1b[{d}D", .{steps});
     }
+}
+
+fn findWordForward(self: *Shell, boundary: WordBoundary) usize {
+    const buf = self.current_command[0..self.current_command_len];
+    var pos = self.cursor_pos;
+    const max = self.current_command_len;
+
+    if (pos >= max) return max;
+
+    return switch (boundary) {
+        .word => blk: {
+            // Skip current word (alphanumeric + underscore)
+            while (pos < max and isWordChar(buf[pos])) : (pos += 1) {}
+            // Skip whitespace
+            while (pos < max and isWhitespace(buf[pos])) : (pos += 1) {}
+            break :blk pos;
+        },
+        .WORD => blk: {
+            // Skip non-whitespace
+            while (pos < max and !isWhitespace(buf[pos])) : (pos += 1) {}
+            // Skip whitespace
+            while (pos < max and isWhitespace(buf[pos])) : (pos += 1) {}
+            break :blk pos;
+        },
+        .word_end => blk: {
+            // Move forward one if we're on the last char of a word
+            if (pos < max and isWordChar(buf[pos]) and
+                (pos + 1 >= max or !isWordChar(buf[pos + 1])))
+            {
+                pos += 1;
+            }
+            // Skip whitespace
+            while (pos < max and isWhitespace(buf[pos])) : (pos += 1) {}
+            // Move to end of word
+            while (pos < max and isWordChar(buf[pos])) : (pos += 1) {}
+            // Back up one to be ON the last character
+            if (pos > self.cursor_pos) pos -= 1;
+            break :blk pos;
+        },
+        .WORD_end => blk: {
+            // Move forward one if we're on the last char of a WORD
+            if (pos < max and !isWhitespace(buf[pos]) and
+                (pos + 1 >= max or isWhitespace(buf[pos + 1])))
+            {
+                pos += 1;
+            }
+            // Skip whitespace
+            while (pos < max and isWhitespace(buf[pos])) : (pos += 1) {}
+            // Move to end of WORD
+            while (pos < max and !isWhitespace(buf[pos])) : (pos += 1) {}
+            // Back up one to be ON the last character
+            if (pos > self.cursor_pos) pos -= 1;
+            break :blk pos;
+        },
+    };
+}
+
+fn findWordBackward(self: *Shell, boundary: WordBoundary) usize {
+    const buf = self.current_command[0..self.current_command_len];
+    if (self.cursor_pos == 0) return 0;
+
+    var pos = self.cursor_pos - 1;
+
+    return switch (boundary) {
+        .word, .word_end => blk: {
+            // Skip whitespace
+            while (pos > 0 and isWhitespace(buf[pos])) : (pos -= 1) {}
+            // Skip to beginning of word
+            while (pos > 0 and isWordChar(buf[pos - 1])) : (pos -= 1) {}
+            break :blk pos;
+        },
+        .WORD, .WORD_end => blk: {
+            // Skip whitespace
+            while (pos > 0 and isWhitespace(buf[pos])) : (pos -= 1) {}
+            // Skip to beginning of WORD
+            while (pos > 0 and !isWhitespace(buf[pos - 1])) : (pos -= 1) {}
+            break :blk pos;
+        },
+    };
+}
+
+fn isWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn isWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t';
 }
 
 fn readNextAction(self: *Shell) !Action {
@@ -687,10 +776,13 @@ fn normalModeAction(char: u8) Action {
         'l' => .{ .move_cursor = .{ .relative = 1 } },
         '0' => .{ .move_cursor = .to_line_start },
         '$' => .{ .move_cursor = .to_line_end },
-        'w' => .{ .move_cursor = .{ .to_word_boundary = .word } },
-        'b' => .{ .move_cursor = .{ .to_word_boundary = .word } },
-        'e' => .{ .move_cursor = .{ .to_word_boundary = .word_end } },
-        'E' => .{ .move_cursor = .{ .to_word_boundary = .WORD_end } },
+
+        'w' => .{ .move_cursor = .{ .word_forward = .word } },
+        'W' => .{ .move_cursor = .{ .word_forward = .WORD } },
+        'b' => .{ .move_cursor = .{ .word_backward = .word } },
+        'B' => .{ .move_cursor = .{ .word_backward = .WORD } },
+        'e' => .{ .move_cursor = .{ .word_forward = .word_end } },
+        'E' => .{ .move_cursor = .{ .word_forward = .WORD_end } },
 
         'j' => .{ .history_nav = .down },
         'k' => .{ .history_nav = .up },
@@ -780,8 +872,8 @@ fn handleExtendedEscapeSequence() !Action {
     if (direction_read == 0) return .none;
 
     return switch (temp_buf[0]) {
-        'C' => .{ .move_cursor = .{ .to_word_boundary = .word } },
-        'D' => .{ .move_cursor = .{ .to_word_boundary = .word } },
+        'C' => .{ .move_cursor = .{ .word_forward = .word } },
+        'D' => .{ .move_cursor = .{ .word_backward = .word } },
         'A' => .{ .move_cursor = .to_line_start },
         'B' => .{ .move_cursor = .to_line_end },
         else => .none,

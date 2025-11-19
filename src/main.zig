@@ -3,7 +3,7 @@
 const std = @import("std");
 const build = @import("build.zig.zon");
 const clap = @import("clap");
-const Shell = @import("shell.zig").Shell;
+const Shell = @import("Shell.zig");
 const build_options = @import("build_options");
 
 pub fn main() !void {

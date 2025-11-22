@@ -68,6 +68,11 @@ const VimModeAction = union(enum) {
     set_mode: VimMode,
 };
 
+const CycleDirection = enum {
+    forward,
+    backward,
+};
+
 const Action = union(enum) {
     none,
     cancel,
@@ -80,6 +85,7 @@ const Action = union(enum) {
     backspace,
     delete: DeleteAction,
     tap_complete,
+    cycle_complete: CycleDirection,
     move_cursor: MoveCursorAction,
     history_nav: HistoryDirection,
     enter_search_mode: SearchDirection,
@@ -120,6 +126,16 @@ clipboard_len: usize = 0,
 search_mode: bool = false,
 search_buffer: []u8,
 search_len: usize = 0,
+// completion state
+completion_mode: bool = false,
+completion_matches: std.ArrayList([]const u8),
+completion_index: usize = 0,
+completion_word_start: usize = 0,
+completion_word_end: usize = 0,
+completion_original_len: usize = 0,
+completion_pattern_len: usize = 0,
+completion_menu_lines: usize = 0,
+completion_displayed: bool = false,
 
 stdout_writer: std.fs.File.Writer,
 log_file: ?std.fs.File = null,
@@ -155,6 +171,15 @@ pub fn init(allocator: std.mem.Allocator) !*Shell {
         .search_mode = false,
         .search_buffer = search_buffer,
         .search_len = 0,
+        .completion_mode = false,
+        .completion_matches = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 },
+        .completion_index = 0,
+        .completion_word_start = 0,
+        .completion_word_end = 0,
+        .completion_original_len = 0,
+        .completion_pattern_len = 0,
+        .completion_menu_lines = 0,
+        .completion_displayed = false,
         .stdout_writer = .init(.stdout(), writer_buffer),
     };
 
@@ -191,6 +216,13 @@ pub fn deinit(self: *Shell) void {
     self.variables.deinit();
 
     if (self.history) |h| h.deinit();
+
+    // cleanup completion matches
+    for (self.completion_matches.items) |match| {
+        self.allocator.free(match);
+    }
+    self.completion_matches.deinit(self.allocator);
+
     self.allocator.free(self.current_command);
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
@@ -342,6 +374,7 @@ fn handleAction(self: *Shell, action: Action) !void {
         .none => {},
 
         .cancel => {
+            self.exitCompletionMode();
             self.current_command_len = 0;
             self.cursor_pos = 0;
             self.history_index = -1;
@@ -357,6 +390,9 @@ fn handleAction(self: *Shell, action: Action) !void {
         },
 
         .input_char => |char| {
+            // exit completion mode when typing
+            self.exitCompletionMode();
+
             if (self.search_mode) {
                 // Add to search buffer
                 if (self.search_len < self.search_buffer.len) {
@@ -464,6 +500,8 @@ fn handleAction(self: *Shell, action: Action) !void {
                 // In search mode, treat enter as exit search
                 try self.handleAction(.{ .exit_search_mode = true });
             } else {
+                self.exitCompletionMode();
+
                 const command = std.mem.trim(u8, self.current_command[0..self.current_command_len], " \t\n\r");
 
                 try self.stdout().writeByte('\n');
@@ -519,7 +557,19 @@ fn handleAction(self: *Shell, action: Action) !void {
         },
 
         .tap_complete => {
-            // TODO
+            if (self.completion_mode) {
+                try self.handleCompletionCycle(.forward);
+            } else {
+                try self.handleTabCompletion();
+            }
+        },
+
+        .cycle_complete => |direction| {
+            if (self.completion_mode) {
+                try self.handleCompletionCycle(direction);
+            } else {
+                try self.handleTabCompletion();
+            }
         },
 
         .move_cursor => |move| {
@@ -893,7 +943,7 @@ fn escapeSequenceAction() !Action {
         'B' => .{ .history_nav = .down }, // Down arrow
         'C' => .{ .move_cursor = .{ .relative = 1 } }, // Right arrow
         'D' => .{ .move_cursor = .{ .relative = -1 } }, // Left arrow
-        'Z' => .tap_complete, // Shift+Tab (for completion list)
+        'Z' => .{ .cycle_complete = .backward }, // Shift+Tab
         'H' => .{ .move_cursor = .to_line_start }, // Home key
         'F' => .{ .move_cursor = .to_line_end }, // End key
         '1' => try handleExtendedEscapeSequence(), // Ctrl+arrows, etc.
@@ -1026,6 +1076,336 @@ fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
     // Update current command length and cursor position
     self.current_command_len = copy_len;
     self.cursor_pos = copy_len;
+}
+
+fn handleTabCompletion(self: *Shell) !void {
+    if (self.current_command_len == 0) return;
+
+    // find the word at cursor position
+    const cmd = self.current_command[0..self.current_command_len];
+    const word_result = self.extractWordAtCursor(cmd) orelse return;
+
+    const word = word_result.word;
+    const word_end = word_result.end;
+
+    // determine base directory and search pattern
+    const search_dir: []const u8 = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash| blk: {
+        if (last_slash == 0) {
+            // absolute path like "/etc"
+            break :blk "/";
+        } else {
+            // relative path with directory like "src/"
+            break :blk word[0..last_slash];
+        }
+    } else "."; // no slash, search in current directory
+
+    const pattern = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash|
+        word[last_slash + 1 ..]
+    else
+        word;
+
+    // find matches
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
+    defer {
+        for (matches.items) |match| {
+            self.allocator.free(match);
+        }
+        matches.deinit(self.allocator);
+    }
+
+    const dir = std.fs.cwd().openDir(search_dir, .{ .iterate = true }) catch return;
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, pattern)) {
+            const full_name = if (entry.kind == .directory)
+                try std.fmt.allocPrint(self.allocator, "{s}/", .{entry.name})
+            else
+                try self.allocator.dupe(u8, entry.name);
+            try matches.append(self.allocator, full_name);
+        }
+    }
+
+    if (matches.items.len == 0) {
+        // no matches, do nothing
+        return;
+    } else if (matches.items.len == 1) {
+        // single match - complete it
+        const match = matches.items[0];
+        const completion = match[pattern.len..];
+
+        // insert completion at cursor
+        const new_len = self.current_command_len + completion.len;
+        if (new_len >= self.current_command.len) return error.InputTooLong;
+
+        // shift content after word_end to make room
+        if (word_end < self.current_command_len) {
+            @memmove(
+                self.current_command[word_end + completion.len .. new_len],
+                self.current_command[word_end..self.current_command_len],
+            );
+        }
+
+        // insert completion
+        @memcpy(
+            self.current_command[word_end .. word_end + completion.len],
+            completion,
+        );
+
+        self.current_command_len = new_len;
+        self.cursor_pos = word_end + completion.len;
+        try self.redrawLine();
+    } else {
+        // multiple matches - enter completion mode
+        // store matches and word boundaries
+        self.exitCompletionMode(); // clear any previous state
+
+        for (matches.items) |match| {
+            const owned = try self.allocator.dupe(u8, match);
+            try self.completion_matches.append(self.allocator, owned);
+        }
+
+        self.completion_mode = true;
+        self.completion_index = 0;
+        self.completion_word_start = word_result.start;
+        self.completion_word_end = word_end;
+        self.completion_original_len = self.current_command_len;
+        self.completion_pattern_len = pattern.len;
+
+        // apply first completion
+        try self.applyCompletion(pattern.len);
+
+        // show all matches with first one highlighted
+        try self.displayCompletions();
+    }
+}
+
+const WordResult = struct {
+    word: []const u8,
+    start: usize,
+    end: usize,
+};
+
+fn extractWordAtCursor(self: *Shell, cmd: []const u8) ?WordResult {
+    if (cmd.len == 0) return null;
+
+    // find word boundaries around cursor
+    var start = self.cursor_pos;
+    var end = self.cursor_pos;
+
+    // find start of word (go backwards until space or start)
+    while (start > 0 and cmd[start - 1] != ' ') {
+        start -= 1;
+    }
+
+    // find end of word (go forward until space or end)
+    while (end < cmd.len and cmd[end] != ' ') {
+        end += 1;
+    }
+
+    if (start == end) return null;
+
+    return WordResult{
+        .word = cmd[start..end],
+        .start = start,
+        .end = end,
+    };
+}
+
+fn exitCompletionMode(self: *Shell) void {
+    if (!self.completion_mode) return;
+
+    // free all completion matches
+    for (self.completion_matches.items) |match| {
+        self.allocator.free(match);
+    }
+    self.completion_matches.clearRetainingCapacity();
+
+    self.completion_mode = false;
+    self.completion_index = 0;
+    self.completion_pattern_len = 0;
+    self.completion_menu_lines = 0;
+    self.completion_displayed = false;
+}
+
+fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
+    if (self.completion_matches.items.len == 0) return;
+
+    const old_index = self.completion_index;
+
+    // cycle index
+    switch (direction) {
+        .forward => {
+            self.completion_index = (self.completion_index + 1) % self.completion_matches.items.len;
+        },
+        .backward => {
+            if (self.completion_index == 0) {
+                self.completion_index = self.completion_matches.items.len - 1;
+            } else {
+                self.completion_index -= 1;
+            }
+        },
+    }
+
+    // apply the new completion
+    try self.applyCompletion(self.completion_pattern_len);
+
+    if (self.completion_displayed) {
+        // update highlight in place
+        try self.updateCompletionHighlight(old_index);
+    } else {
+        // display menu for first time
+        try self.displayCompletions();
+    }
+}
+
+fn applyCompletion(self: *Shell, pattern_len: usize) !void {
+    if (self.completion_matches.items.len == 0) return;
+
+    const match = self.completion_matches.items[self.completion_index];
+
+    // calculate how much of the match to add (skip the pattern prefix)
+    const completion = match[pattern_len..];
+
+    // restore command to original state first
+    self.current_command_len = self.completion_original_len;
+
+    // calculate new length
+    const new_len = self.current_command_len + completion.len;
+    if (new_len >= self.current_command.len) return error.InputTooLong;
+
+    // shift content after word_end to make room
+    if (self.completion_word_end < self.current_command_len) {
+        @memmove(
+            self.current_command[self.completion_word_end + completion.len .. new_len],
+            self.current_command[self.completion_word_end..self.current_command_len],
+        );
+    }
+
+    // insert completion
+    @memcpy(
+        self.current_command[self.completion_word_end .. self.completion_word_end + completion.len],
+        completion,
+    );
+
+    self.current_command_len = new_len;
+    self.cursor_pos = self.completion_word_end + completion.len;
+}
+
+fn displayCompletions(self: *Shell) !void {
+    if (self.completion_matches.items.len == 0) return;
+
+    // show matches in columns with current one highlighted
+    try self.stdout().writeByte('\n');
+
+    // calculate column width
+    var max_len: usize = 0;
+    for (self.completion_matches.items) |match| {
+        if (match.len > max_len) max_len = match.len;
+    }
+    const col_width = max_len + 2;
+    const term_width = 80;
+    const cols = @max(1, term_width / col_width);
+
+    // calculate number of lines in menu
+    const menu_lines = (self.completion_matches.items.len + cols - 1) / cols;
+    self.completion_menu_lines = menu_lines;
+
+    // print matches
+    for (self.completion_matches.items, 0..) |match, i| {
+        // highlight selected item
+        if (i == self.completion_index) {
+            try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, match, tty.Style.reset });
+        } else {
+            try self.stdout().print("{s}", .{match});
+        }
+
+        // padding
+        const padding = col_width - match.len;
+        var j: usize = 0;
+        while (j < padding) : (j += 1) {
+            try self.stdout().writeByte(' ');
+        }
+
+        // newline after every cols items or at end
+        if ((i + 1) % cols == 0 or i == self.completion_matches.items.len - 1) {
+            try self.stdout().writeByte('\n');
+        }
+    }
+
+    // redraw prompt and command
+    try self.printFancyPrompt();
+    try self.stdout().writeAll(self.current_command[0..self.current_command_len]);
+
+    // move cursor to correct position
+    if (self.cursor_pos < self.current_command_len) {
+        const chars_back = self.current_command_len - self.cursor_pos;
+        try self.stdout().print("\x1b[{d}D", .{chars_back});
+    }
+
+    self.completion_displayed = true;
+}
+
+fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
+    // calculate column layout
+    var max_len: usize = 0;
+    for (self.completion_matches.items) |match| {
+        if (match.len > max_len) max_len = match.len;
+    }
+    const col_width = max_len + 2;
+    const term_width = 80;
+    const cols = @max(1, term_width / col_width);
+
+    // calculate positions of old and new items
+    const old_row = old_index / cols;
+    const old_col = old_index % cols;
+    const new_row = self.completion_index / cols;
+    const new_col = self.completion_index % cols;
+
+    // move cursor up to the menu area (menu_lines + 1 for prompt line)
+    const lines_up = self.completion_menu_lines + 1;
+    try self.stdout().print("\x1b[{d}A", .{lines_up});
+
+    // unhighlight old item
+    // move to old item's line
+    try self.stdout().print("\x1b[{d}B", .{old_row + 1}); // +1 to skip past initial newline position
+    // move to old item's column
+    const old_col_pos = old_col * col_width;
+    try self.stdout().print("\x1b[{d}G", .{old_col_pos + 1}); // +1 because columns are 1-indexed
+    // print without highlight
+    try self.stdout().print("{s}", .{self.completion_matches.items[old_index]});
+
+    // move to new item and highlight it
+    // calculate relative move from old item to new item
+    if (new_row > old_row) {
+        try self.stdout().print("\x1b[{d}B", .{new_row - old_row});
+    } else if (old_row > new_row) {
+        try self.stdout().print("\x1b[{d}A", .{old_row - new_row});
+    }
+    const new_col_pos = new_col * col_width;
+    try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
+    // print with highlight
+    try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
+
+    // move cursor back to command line
+    // first, move to bottom of menu
+    const current_row = new_row + 1;
+    const rows_to_bottom = self.completion_menu_lines - current_row;
+    if (rows_to_bottom > 0) {
+        try self.stdout().print("\x1b[{d}B", .{rows_to_bottom});
+    }
+    // then move down one more line to prompt
+    try self.stdout().print("\x1b[{d}B", .{1});
+
+    // redraw command line
+    try self.stdout().writeAll("\r\x1b[K"); // return and clear to end of line
+    try self.printFancyPrompt();
+    try self.stdout().writeAll(self.current_command[0..self.current_command_len]);
+
+    // move cursor to correct position
+    if (self.cursor_pos < self.current_command_len) {
+        const chars_back = self.current_command_len - self.cursor_pos;
+        try self.stdout().print("\x1b[{d}D", .{chars_back});
+    }
 }
 
 fn redrawLine(self: *Shell) !void {

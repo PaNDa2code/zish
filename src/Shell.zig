@@ -1371,8 +1371,8 @@ fn displayCompletions(self: *Shell) !void {
 
     const term_width = self.getTerminalWidth();
 
-    // in very small terminals, use simple single-column display
-    if (term_width < 40) {
+    // in narrow terminals, use simple single-column display to avoid wrapping issues
+    if (term_width < 80) {
         try self.stdout().writeByte('\n');
 
         for (self.completion_matches.items, 0..) |match, i| {
@@ -1427,14 +1427,16 @@ fn displayCompletions(self: *Shell) !void {
 fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     const term_width = self.getTerminalWidth();
 
-    // for small terminals, just redisplay everything (simpler and more robust)
-    if (term_width < 40) {
-        // clear old display
+    // for narrow terminals, just redisplay everything (simpler and more robust)
+    if (term_width < 80) {
+        // move to beginning of current line, then move up to top of menu
+        try self.stdout().writeAll("\r");
         if (self.completion_menu_lines > 0) {
-            try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1});
+            try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
         }
+        // clear from here to end of screen
         try self.stdout().writeAll("\x1b[J");
-        // redraw
+        // redraw everything
         try self.displayCompletions();
         return;
     }

@@ -30,10 +30,10 @@ jobs:
       - name: setup zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: master
 
       - name: build ${{ matrix.target }}
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        run: zig build --release=fast -Dtarget=${{ matrix.target }}
 
       - name: package
         run: |

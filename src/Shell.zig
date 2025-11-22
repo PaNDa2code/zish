@@ -142,6 +142,9 @@ completion_displayed: bool = false,
 
 // terminal resize handling
 terminal_resized: bool = false,
+terminal_width: usize = 80,
+terminal_height: usize = 24,
+last_resize_time: i64 = 0,
 
 stdout_writer: std.fs.File.Writer,
 log_file: ?std.fs.File = null,
@@ -242,6 +245,11 @@ pub fn run(self: *Shell) !void {
     // setup signal handler for terminal resize
     self.setupResizeHandler();
 
+    // initialize terminal dimensions
+    const initial_size = self.getTerminalSize();
+    self.terminal_width = initial_size.width;
+    self.terminal_height = initial_size.height;
+
     // set initial cursor style based on vim mode
     const initial_cursor = if (self.vim_mode_enabled and self.vim_mode == .normal)
         CursorStyle.block
@@ -302,7 +310,12 @@ fn setCursorStyle(self: *Shell, style: CursorStyle) !void {
     try self.stdout().writeAll(style.escapeCode());
 }
 
-fn getTerminalWidth(_: *Shell) usize {
+const TerminalSize = struct {
+    width: usize,
+    height: usize,
+};
+
+fn getTerminalSize(_: *Shell) TerminalSize {
     const TIOCGWINSZ = if (@hasDecl(std.posix.system, "T")) std.posix.system.T.IOCGWINSZ else 0x5413;
 
     const winsize = extern struct {
@@ -315,11 +328,15 @@ fn getTerminalWidth(_: *Shell) usize {
     var ws: winsize = undefined;
     const result = std.posix.system.ioctl(std.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws));
 
-    if (result == 0 and ws.ws_col > 0) {
-        return ws.ws_col;
+    if (result == 0 and ws.ws_col > 0 and ws.ws_row > 0) {
+        return .{ .width = ws.ws_col, .height = ws.ws_row };
     }
 
-    return 80; // fallback to 80 if ioctl fails
+    return .{ .width = 80, .height = 24 }; // fallback if ioctl fails
+}
+
+fn getTerminalWidth(self: *Shell) usize {
+    return self.getTerminalSize().width;
 }
 
 fn handleSigwinch(_: c_int) callconv(.c) void {
@@ -345,16 +362,48 @@ fn setupResizeHandler(self: *Shell) void {
 }
 
 fn handleResize(self: *Shell) !void {
-    if (self.completion_mode and self.completion_displayed) {
-        // clear old completion display
-        if (self.completion_menu_lines > 0) {
-            // move cursor up past menu
-            try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
-        }
-        // clear from cursor to end of screen
-        try self.stdout().writeAll("\x1b[J");
+    // get current terminal size
+    const new_size = self.getTerminalSize();
 
-        // redraw everything
+    // check if dimensions actually changed
+    if (new_size.width == self.terminal_width and new_size.height == self.terminal_height) {
+        return; // spurious SIGWINCH, nothing changed
+    }
+
+    // debounce rapid resizes
+    const now = std.time.milliTimestamp();
+    const debounce_ms = 50; // wait 50ms between redraws
+    if (now - self.last_resize_time < debounce_ms) {
+        // schedule another check by keeping the flag set
+        self.terminal_resized = true;
+        return;
+    }
+    self.last_resize_time = now;
+
+    const old_width = self.terminal_width;
+    const old_height = self.terminal_height;
+
+    // update stored dimensions
+    self.terminal_width = new_size.width;
+    self.terminal_height = new_size.height;
+
+    if (self.completion_mode and self.completion_displayed) {
+        // smart clearing: only clear if we're shrinking or need to reflow
+        if (new_size.width < old_width or new_size.height < old_height) {
+            // terminal shrank, need full clear
+            if (self.completion_menu_lines > 0) {
+                try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
+            }
+            try self.stdout().writeAll("\x1b[J");
+        } else {
+            // terminal grew, just reposition
+            if (self.completion_menu_lines > 0) {
+                try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
+            }
+            try self.stdout().writeAll("\x1b[J");
+        }
+
+        // redraw with new dimensions
         try self.displayCompletions();
     } else {
         // just redraw the current line
@@ -1369,13 +1418,35 @@ fn applyCompletion(self: *Shell, pattern_len: usize) !void {
 fn displayCompletions(self: *Shell) !void {
     if (self.completion_matches.items.len == 0) return;
 
-    const term_width = self.getTerminalWidth();
+    const term_width = self.terminal_width;
+    const term_height = self.terminal_height;
+
+    // calculate available space: terminal height - prompt line - input line - 1 for safety
+    const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
     // in narrow terminals, use simple single-column display to avoid wrapping issues
     if (term_width < 80) {
         try self.stdout().writeByte('\n');
 
-        for (self.completion_matches.items, 0..) |match, i| {
+        // cap the number of items displayed to available height
+        const items_to_show = @min(self.completion_matches.items.len, max_menu_height);
+
+        // if we can't show all items, show context around selected item
+        const start_idx = if (self.completion_matches.items.len > items_to_show) blk: {
+            // center the selected item in the visible window
+            const half_window = items_to_show / 2;
+            if (self.completion_index < half_window) {
+                break :blk 0;
+            } else if (self.completion_index + half_window >= self.completion_matches.items.len) {
+                break :blk self.completion_matches.items.len - items_to_show;
+            } else {
+                break :blk self.completion_index - half_window;
+            }
+        } else 0;
+
+        const end_idx = @min(start_idx + items_to_show, self.completion_matches.items.len);
+
+        for (self.completion_matches.items[start_idx..end_idx], start_idx..) |match, i| {
             if (i == self.completion_index) {
                 try self.stdout().print("{f}{s}{f}\n", .{ tty.Style.reverse, match, tty.Style.reset });
             } else {
@@ -1383,7 +1454,17 @@ fn displayCompletions(self: *Shell) !void {
             }
         }
 
-        self.completion_menu_lines = self.completion_matches.items.len;
+        // show indicator if there are more items
+        if (end_idx < self.completion_matches.items.len) {
+            try self.stdout().print("... ({} more)\n", .{self.completion_matches.items.len - end_idx});
+            self.completion_menu_lines = items_to_show + 1;
+        } else if (start_idx > 0) {
+            try self.stdout().print("... ({} hidden above)\n", .{start_idx});
+            self.completion_menu_lines = items_to_show + 1;
+        } else {
+            self.completion_menu_lines = items_to_show;
+        }
+
         try self.redrawLine();
         self.completion_displayed = true;
         return;
@@ -1399,10 +1480,15 @@ fn displayCompletions(self: *Shell) !void {
     const col_width = max_len + 2;
     const cols = @max(1, term_width / col_width);
 
-    const menu_lines = (self.completion_matches.items.len + cols - 1) / cols;
+    const total_menu_lines = (self.completion_matches.items.len + cols - 1) / cols;
+    const menu_lines = @min(total_menu_lines, max_menu_height);
     self.completion_menu_lines = menu_lines;
 
-    for (self.completion_matches.items, 0..) |match, i| {
+    // calculate how many items we can display
+    const max_items = menu_lines * cols;
+    const items_to_show = @min(self.completion_matches.items.len, max_items);
+
+    for (self.completion_matches.items[0..items_to_show], 0..) |match, i| {
         if (i == self.completion_index) {
             try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, match, tty.Style.reset });
         } else {
@@ -1415,9 +1501,15 @@ fn displayCompletions(self: *Shell) !void {
             try self.stdout().writeByte(' ');
         }
 
-        if ((i + 1) % cols == 0 or i == self.completion_matches.items.len - 1) {
+        if ((i + 1) % cols == 0 or i == items_to_show - 1) {
             try self.stdout().writeByte('\n');
         }
+    }
+
+    // show indicator if there are more items
+    if (items_to_show < self.completion_matches.items.len) {
+        try self.stdout().print("... ({} more matches)\n", .{self.completion_matches.items.len - items_to_show});
+        self.completion_menu_lines += 1;
     }
 
     try self.redrawLine();
@@ -1425,7 +1517,7 @@ fn displayCompletions(self: *Shell) !void {
 }
 
 fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
-    const term_width = self.getTerminalWidth();
+    const term_width = self.terminal_width;
 
     // for narrow terminals, just redisplay everything (simpler and more robust)
     if (term_width < 80) {

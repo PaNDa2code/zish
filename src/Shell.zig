@@ -1369,88 +1369,97 @@ fn applyCompletion(self: *Shell, pattern_len: usize) !void {
 fn displayCompletions(self: *Shell) !void {
     if (self.completion_matches.items.len == 0) return;
 
-    // show matches in columns with current one highlighted
+    const term_width = self.getTerminalWidth();
+
+    // in very small terminals, use simple single-column display
+    if (term_width < 40) {
+        try self.stdout().writeByte('\n');
+
+        for (self.completion_matches.items, 0..) |match, i| {
+            if (i == self.completion_index) {
+                try self.stdout().print("{f}{s}{f}\n", .{ tty.Style.reverse, match, tty.Style.reset });
+            } else {
+                try self.stdout().print("{s}\n", .{match});
+            }
+        }
+
+        self.completion_menu_lines = self.completion_matches.items.len;
+        try self.redrawLine();
+        self.completion_displayed = true;
+        return;
+    }
+
+    // for normal terminals, show matches in columns
     try self.stdout().writeByte('\n');
 
-    // calculate column width
     var max_len: usize = 0;
     for (self.completion_matches.items) |match| {
         if (match.len > max_len) max_len = match.len;
     }
     const col_width = max_len + 2;
-    const term_width = self.getTerminalWidth();
     const cols = @max(1, term_width / col_width);
 
-    // calculate number of lines in menu
     const menu_lines = (self.completion_matches.items.len + cols - 1) / cols;
     self.completion_menu_lines = menu_lines;
 
-    // print matches
     for (self.completion_matches.items, 0..) |match, i| {
-        // highlight selected item
         if (i == self.completion_index) {
             try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, match, tty.Style.reset });
         } else {
             try self.stdout().print("{s}", .{match});
         }
 
-        // padding
         const padding = col_width - match.len;
         var j: usize = 0;
         while (j < padding) : (j += 1) {
             try self.stdout().writeByte(' ');
         }
 
-        // newline after every cols items or at end
         if ((i + 1) % cols == 0 or i == self.completion_matches.items.len - 1) {
             try self.stdout().writeByte('\n');
         }
     }
 
-    // redraw prompt and command
-    try self.printFancyPrompt();
-    try self.stdout().writeAll(self.current_command[0..self.current_command_len]);
-
-    // move cursor to correct position
-    if (self.cursor_pos < self.current_command_len) {
-        const chars_back = self.current_command_len - self.cursor_pos;
-        try self.stdout().print("\x1b[{d}D", .{chars_back});
-    }
-
+    try self.redrawLine();
     self.completion_displayed = true;
 }
 
 fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
-    // calculate column layout
+    const term_width = self.getTerminalWidth();
+
+    // for small terminals, just redisplay everything (simpler and more robust)
+    if (term_width < 40) {
+        // clear old display
+        if (self.completion_menu_lines > 0) {
+            try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1});
+        }
+        try self.stdout().writeAll("\x1b[J");
+        // redraw
+        try self.displayCompletions();
+        return;
+    }
+
+    // for normal terminals, use optimized cursor-based update
     var max_len: usize = 0;
     for (self.completion_matches.items) |match| {
         if (match.len > max_len) max_len = match.len;
     }
     const col_width = max_len + 2;
-    const term_width = self.getTerminalWidth();
     const cols = @max(1, term_width / col_width);
 
-    // calculate positions of old and new items
     const old_row = old_index / cols;
     const old_col = old_index % cols;
     const new_row = self.completion_index / cols;
     const new_col = self.completion_index % cols;
 
-    // move cursor up to the menu area (menu_lines + 1 for prompt line)
     const lines_up = self.completion_menu_lines + 1;
     try self.stdout().print("\x1b[{d}A", .{lines_up});
 
-    // unhighlight old item
-    // move to old item's line
-    try self.stdout().print("\x1b[{d}B", .{old_row + 1}); // +1 to skip past initial newline position
-    // move to old item's column
+    try self.stdout().print("\x1b[{d}B", .{old_row + 1});
     const old_col_pos = old_col * col_width;
-    try self.stdout().print("\x1b[{d}G", .{old_col_pos + 1}); // +1 because columns are 1-indexed
-    // print without highlight
+    try self.stdout().print("\x1b[{d}G", .{old_col_pos + 1});
     try self.stdout().print("{s}", .{self.completion_matches.items[old_index]});
 
-    // move to new item and highlight it
-    // calculate relative move from old item to new item
     if (new_row > old_row) {
         try self.stdout().print("\x1b[{d}B", .{new_row - old_row});
     } else if (old_row > new_row) {
@@ -1458,29 +1467,17 @@ fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     }
     const new_col_pos = new_col * col_width;
     try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
-    // print with highlight
     try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
 
-    // move cursor back to command line
-    // first, move to bottom of menu
     const current_row = new_row + 1;
     const rows_to_bottom = self.completion_menu_lines - current_row;
     if (rows_to_bottom > 0) {
         try self.stdout().print("\x1b[{d}B", .{rows_to_bottom});
     }
-    // then move down one more line to prompt
     try self.stdout().print("\x1b[{d}B", .{1});
 
-    // redraw command line
-    try self.stdout().writeAll("\r\x1b[K"); // return and clear to end of line
-    try self.printFancyPrompt();
-    try self.stdout().writeAll(self.current_command[0..self.current_command_len]);
-
-    // move cursor to correct position
-    if (self.cursor_pos < self.current_command_len) {
-        const chars_back = self.current_command_len - self.cursor_pos;
-        try self.stdout().print("\x1b[{d}D", .{chars_back});
-    }
+    try self.stdout().writeAll("\r\x1b[K");
+    try self.redrawLine();
 }
 
 fn redrawLine(self: *Shell) !void {

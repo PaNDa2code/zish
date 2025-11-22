@@ -6,6 +6,9 @@ const lexer = @import("lexer.zig");
 const hist = @import("history.zig");
 const tty = @import("tty.zig");
 
+// global shell instance for signal handler
+var global_shell: ?*Shell = null;
+
 const VimMode = enum {
     insert,
     normal,
@@ -137,6 +140,9 @@ completion_pattern_len: usize = 0,
 completion_menu_lines: usize = 0,
 completion_displayed: bool = false,
 
+// terminal resize handling
+terminal_resized: bool = false,
+
 stdout_writer: std.fs.File.Writer,
 log_file: ?std.fs.File = null,
 
@@ -233,6 +239,9 @@ pub fn deinit(self: *Shell) void {
 pub fn run(self: *Shell) !void {
     self.running = true;
 
+    // setup signal handler for terminal resize
+    self.setupResizeHandler();
+
     // set initial cursor style based on vim mode
     const initial_cursor = if (self.vim_mode_enabled and self.vim_mode == .normal)
         CursorStyle.block
@@ -246,6 +255,12 @@ pub fn run(self: *Shell) !void {
     var last_action: Action = .none;
 
     while (self.running) {
+        // handle terminal resize
+        if (self.terminal_resized) {
+            self.terminal_resized = false;
+            try self.handleResize();
+        }
+
         try self.log(last_action);
         last_action = try self.readNextAction();
         try self.handleAction(last_action);
@@ -285,6 +300,66 @@ const CursorStyle = enum {
 
 fn setCursorStyle(self: *Shell, style: CursorStyle) !void {
     try self.stdout().writeAll(style.escapeCode());
+}
+
+fn getTerminalWidth(_: *Shell) usize {
+    const TIOCGWINSZ = if (@hasDecl(std.posix.system, "T")) std.posix.system.T.IOCGWINSZ else 0x5413;
+
+    const winsize = extern struct {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    };
+
+    var ws: winsize = undefined;
+    const result = std.posix.system.ioctl(std.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws));
+
+    if (result == 0 and ws.ws_col > 0) {
+        return ws.ws_col;
+    }
+
+    return 80; // fallback to 80 if ioctl fails
+}
+
+fn handleSigwinch(_: c_int) callconv(.c) void {
+    if (global_shell) |shell| {
+        shell.terminal_resized = true;
+    }
+}
+
+fn setupResizeHandler(self: *Shell) void {
+    global_shell = self;
+
+    const SIGWINCH = if (@hasDecl(std.posix.SIG, "WINCH")) std.posix.SIG.WINCH else 28;
+
+    const empty_mask: std.posix.sigset_t = std.mem.zeroes(std.posix.sigset_t);
+
+    var act = std.posix.Sigaction{
+        .handler = .{ .handler = handleSigwinch },
+        .mask = empty_mask,
+        .flags = 0,
+    };
+
+    std.posix.sigaction(SIGWINCH, &act, null);
+}
+
+fn handleResize(self: *Shell) !void {
+    if (self.completion_mode and self.completion_displayed) {
+        // clear old completion display
+        if (self.completion_menu_lines > 0) {
+            // move cursor up past menu
+            try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
+        }
+        // clear from cursor to end of screen
+        try self.stdout().writeAll("\x1b[J");
+
+        // redraw everything
+        try self.displayCompletions();
+    } else {
+        // just redraw the current line
+        try self.redrawLine();
+    }
 }
 
 fn printFancyPrompt(self: *Shell) !void {
@@ -1303,7 +1378,7 @@ fn displayCompletions(self: *Shell) !void {
         if (match.len > max_len) max_len = match.len;
     }
     const col_width = max_len + 2;
-    const term_width = 80;
+    const term_width = self.getTerminalWidth();
     const cols = @max(1, term_width / col_width);
 
     // calculate number of lines in menu
@@ -1352,7 +1427,7 @@ fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
         if (match.len > max_len) max_len = match.len;
     }
     const col_width = max_len + 2;
-    const term_width = 80;
+    const term_width = self.getTerminalWidth();
     const cols = @max(1, term_width / col_width);
 
     // calculate positions of old and new items

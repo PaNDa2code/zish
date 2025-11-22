@@ -12,16 +12,12 @@ jobs:
         include:
           - target: x86_64-linux
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-linux
             os: ubuntu-latest
-            archive: tar.gz
           - target: x86_64-macos
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-macos
             os: ubuntu-latest
-            archive: tar.gz
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -35,14 +31,12 @@ jobs:
       - name: build ${{ matrix.target }}
         run: zig build --release=fast -Dtarget=${{ matrix.target }} -Dlto=false
 
-      - name: package
-        run: |
-          cd zig-out/bin
-          tar czf ../../${{ github.event.repository.name }}-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }} *
+      - name: rename binary
+        run: mv zig-out/bin/zish zig-out/bin/zish-${{ matrix.target }}
 
       - name: release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ github.event.repository.name }}-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
+          files: zig-out/bin/zish-${{ matrix.target }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

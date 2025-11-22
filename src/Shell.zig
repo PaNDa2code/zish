@@ -1839,7 +1839,7 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
     while (true) {
         const token = try lex.nextToken();
         if (token.ty == .Eof) break;
-        if (token.ty == .Word) {
+        if (token.ty == .Word or token.ty == .String) {
             // allocate separate storage for each token to avoid buffer reuse issues
             const owned_token = try self.allocator.dupe(u8, token.value);
             try tokens.append(self.allocator, owned_token);

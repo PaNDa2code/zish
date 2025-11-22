@@ -33,7 +33,7 @@ jobs:
           version: 0.15.2
 
       - name: build ${{ matrix.target }}
-        run: zig build --release=fast -Dtarget=${{ matrix.target }}
+        run: zig build --release=fast -Dtarget=${{ matrix.target }} -Dlto=false
 
       - name: package
         run: |

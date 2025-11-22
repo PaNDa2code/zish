@@ -11,7 +11,7 @@ pub const MAX_ARGS_COUNT = 256;
 pub const MAX_ENV_VALUE_LENGTH = 4096;
 pub const MAX_PARSE_DEPTH = 64;
 
-pub const MAX_PROMET_LENGHT =
+pub const MAX_PROMPT_LENGTH =
     std.fs.max_path_bytes +
     std.fs.max_name_bytes +
     std.posix.HOST_NAME_MAX + 265;

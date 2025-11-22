@@ -45,7 +45,7 @@ const DeleteAction = union(enum) {
     char_at: usize,
 };
 
-const YenkAction = union(enum) {
+const YankAction = union(enum) {
     line,
     selection: struct { start: usize, end: usize },
 };
@@ -83,8 +83,8 @@ const Action = union(enum) {
     move_cursor: MoveCursorAction,
     history_nav: HistoryDirection,
     enter_search_mode: SearchDirection,
-    exit_search_mode: bool, // true execute search, flase cancel
-    yank: YenkAction,
+    exit_search_mode: bool, // true execute search, false cancel
+    yank: YankAction,
     paste: PasteAction,
     insert_at_position: InsertAtPosition,
     undo,
@@ -135,7 +135,7 @@ pub fn init(allocator: std.mem.Allocator) !*Shell {
     const clipboard_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
     const search_buffer = try allocator.alloc(u8, 256); // search queries are usually short
 
-    const writer_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH + types.MAX_PROMET_LENGHT);
+    const writer_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH + types.MAX_PROMPT_LENGTH);
 
     shell.* = .{
         .allocator = allocator,
@@ -171,6 +171,9 @@ pub fn deinit(self: *Shell) void {
     // restore terminal mode before cleanup
     self.disableRawMode();
 
+    // restore default cursor style
+    self.setCursorStyle(.default) catch {};
+
     // cleanup aliases
     var it = self.aliases.iterator();
     while (it.next()) |entry| {
@@ -197,6 +200,13 @@ pub fn deinit(self: *Shell) void {
 
 pub fn run(self: *Shell) !void {
     self.running = true;
+
+    // set initial cursor style based on vim mode
+    const initial_cursor = if (self.vim_mode_enabled and self.vim_mode == .normal)
+        CursorStyle.block
+    else
+        CursorStyle.bar;
+    try self.setCursorStyle(initial_cursor);
 
     try self.printFancyPrompt();
     try self.stdout().flush();
@@ -225,6 +235,25 @@ const CTRL_C = ctrlKey('c');
 const CTRL_T = ctrlKey('t');
 const CTRL_L = ctrlKey('l');
 const CTRL_D = ctrlKey('d');
+
+// cursor styles for vim modes
+const CursorStyle = enum {
+    block, // normal mode
+    bar, // insert mode
+    default, // restore terminal default
+
+    fn escapeCode(self: CursorStyle) []const u8 {
+        return switch (self) {
+            .block => "\x1b[2 q", // steady block cursor
+            .bar => "\x1b[6 q", // steady bar cursor
+            .default => "\x1b[0 q", // reset to default
+        };
+    }
+};
+
+fn setCursorStyle(self: *Shell, style: CursorStyle) !void {
+    try self.stdout().writeAll(style.escapeCode());
+}
 
 fn printFancyPrompt(self: *Shell) !void {
     // get current user
@@ -317,6 +346,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             self.cursor_pos = 0;
             self.history_index = -1;
             self.vim_mode = .insert; // Always return to insert mode
+            try self.setCursorStyle(.bar);
             try self.stdout().writeByte('\n');
             try self.printFancyPrompt();
         },
@@ -452,6 +482,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 self.cursor_pos = 0;
                 self.history_index = -1;
                 self.vim_mode = .insert;
+                try self.setCursorStyle(.bar);
 
                 if (self.running)
                     try self.printFancyPrompt();
@@ -478,6 +509,12 @@ fn handleAction(self: *Shell, action: Action) !void {
                     self.vim_mode = if (self.vim_mode == .normal) .insert else .normal;
                 },
             }
+            // update cursor style to match vim mode
+            const cursor = if (self.vim_mode_enabled and self.vim_mode == .normal)
+                CursorStyle.block
+            else
+                CursorStyle.bar;
+            try self.setCursorStyle(cursor);
             return self.redrawLine();
         },
 
@@ -555,8 +592,15 @@ fn handleAction(self: *Shell, action: Action) !void {
                 return error.InputTooLong;
 
             const insert_pos = switch (paste_action) {
-                .after_cursor => self.cursor_pos,
-                .before_cursor => if (self.cursor_pos > 0) self.cursor_pos - 1 else 0,
+                .after_cursor => blk: {
+                    // paste after the character under cursor
+                    // if at end of line, paste at end; otherwise paste after current char
+                    break :blk if (self.cursor_pos < self.current_command_len)
+                        self.cursor_pos + 1
+                    else
+                        self.cursor_pos;
+                },
+                .before_cursor => self.cursor_pos, // paste before (at) the character under cursor
             };
 
             // Shift content right
@@ -595,6 +639,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 },
             }
             self.vim_mode = .insert;
+            try self.setCursorStyle(.bar);
             try self.redrawLine();
         },
 
@@ -820,12 +865,17 @@ fn escapeSequenceAction() !Action {
     var temp_buf: [3]u8 = undefined;
 
     // Set stdin to non-blocking mode to check if there's more data
+    // If fcntl fails, default to 0 flags (safe fallback for non-blocking check)
     const flags = std.posix.fcntl(stdin.handle, std.posix.F.GETFL, 0) catch 0;
+    // Attempt to set non-blocking mode. If it fails, stdin remains blocking
+    // which is acceptable - we'll just wait for input instead of detecting ESC immediately
     _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags | 0o4000) catch {}; // O_NONBLOCK
 
+    // If read fails in non-blocking mode, treat as no data available (ESC key press)
     const bytes_read = stdin.read(&temp_buf) catch 0;
 
-    // Restore blocking mode
+    // Restore blocking mode. If this fails, subsequent input may behave unexpectedly
+    // but the shell will still function. Terminal state is restored on shell exit.
     _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags) catch {};
 
     // If no following bytes or not '[', it's just ESC key press

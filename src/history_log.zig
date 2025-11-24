@@ -339,7 +339,7 @@ fn generateInstanceId() u8 {
     const pid = std.os.linux.getpid();
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(std.mem.asBytes(&pid));
-    var hostname_buf: [64]u8 = undefined;
+    var hostname_buf: [posix.HOST_NAME_MAX]u8 = undefined;
     if (posix.gethostname(&hostname_buf)) |hostname| {
         hasher.update(hostname);
     } else |_| {}

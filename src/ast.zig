@@ -6,8 +6,11 @@ const std = @import("std");
 pub const NodeType = enum {
     command,
     pipeline,
+    logical_and, // &&
+    logical_or, // ||
     list,
     subshell,
+    background, // &
     if_statement,
     while_loop,
     until_loop,
@@ -15,6 +18,7 @@ pub const NodeType = enum {
     case_statement,
     function_def,
     assignment,
+    redirect, // >, >>, <, 2>, 2>&1
     word,
     string,
     number,
@@ -61,16 +65,16 @@ pub const AstNode = struct {
 
 // typestate-based ast builder with security guarantees
 pub const AstBuilder = struct {
-    arena: std.heap.arenaallocator,
+    arena: std.heap.ArenaAllocator,
     depth: u8,
     node_count: u32,  // prevent ast explosion
 
     const max_nodes = 1024;  // prevent dos via massive asts
     const Self = @This();
 
-    pub fn init(parent_allocator: std.mem.allocator) Self {
+    pub fn init(parent_allocator: std.mem.Allocator) Self {
         return Self{
-            .arena = std.heap.arenaallocator.init(parent_allocator),
+            .arena = std.heap.ArenaAllocator.init(parent_allocator),
             .depth = 0,
             .node_count = 0,
         };
@@ -91,19 +95,19 @@ pub const AstBuilder = struct {
     ) !*const AstNode {
         // prevent ast explosion attacks
         if (self.node_count >= max_nodes) {
-            return error.asttoocomplex;
+            return error.AstTooComplex;
         }
 
         // prevent stack overflow in traversal
         if (self.depth >= 64) {
-            return error.parsetoodeeop;
+            return error.ParseTooDeep;
         }
 
         const allocator = self.arena.allocator();
 
         // bounds check children array
         if (children.len > 256) {
-            return error.toomanychildren;
+            return error.TooManyChildren;
         }
 
         const node = try allocator.create(AstNode);
@@ -129,7 +133,7 @@ pub const AstBuilder = struct {
     }
 
     pub fn createcommand(self: *Self, words: []const *const AstNode, line: u32, column: u32) !*const AstNode {
-        if (words.len == 0) return error.emptycommand;
+        if (words.len == 0) return error.EmptyCommand;
         return self.createnode(.command, "", words, line, column);
     }
 
@@ -177,19 +181,44 @@ pub const AstBuilder = struct {
         // create children array: [variable, value1, value2, ..., body]
         var children = try allocator.alloc(*const AstNode, values.len + 2);
         children[0] = variable;
-        std.mem.copy(*const AstNode, children[1..values.len + 1], values);
+        @memcpy(children[1..values.len + 1], values);
         children[children.len - 1] = body;
 
         return self.createnode(.for_loop, "", children, line, column);
     }
 
     pub fn createpipeline(self: *Self, commands: []const *const AstNode, line: u32, column: u32) !*const AstNode {
-        if (commands.len < 2) return error.invalidpipeline;
+        if (commands.len < 2) return error.InvalidPipeline;
         return self.createnode(.pipeline, "", commands, line, column);
+    }
+
+    pub fn createlogicaland(self: *Self, left: *const AstNode, right: *const AstNode, line: u32, column: u32) !*const AstNode {
+        const children = [_]*const AstNode{ left, right };
+        return self.createnode(.logical_and, "&&", &children, line, column);
+    }
+
+    pub fn createlogicalor(self: *Self, left: *const AstNode, right: *const AstNode, line: u32, column: u32) !*const AstNode {
+        const children = [_]*const AstNode{ left, right };
+        return self.createnode(.logical_or, "||", &children, line, column);
+    }
+
+    pub fn createbackground(self: *Self, command: *const AstNode, line: u32, column: u32) !*const AstNode {
+        const children = [_]*const AstNode{command};
+        return self.createnode(.background, "&", &children, line, column);
+    }
+
+    pub fn createredirect(self: *Self, command: *const AstNode, redirect_type: []const u8, target: *const AstNode, line: u32, column: u32) !*const AstNode {
+        const children = [_]*const AstNode{ command, target };
+        return self.createnode(.redirect, redirect_type, &children, line, column);
     }
 
     pub fn createlist(self: *Self, commands: []const *const AstNode, line: u32, column: u32) !*const AstNode {
         return self.createnode(.list, "", commands, line, column);
+    }
+
+    pub fn createfunctiondef(self: *Self, name: []const u8, body: *const AstNode, line: u32, column: u32) !*const AstNode {
+        const children = [_]*const AstNode{body};
+        return self.createnode(.function_def, name, &children, line, column);
     }
 
     // secure ast traversal with stack overflow protection
@@ -228,23 +257,23 @@ fn validatenode(node: *const AstNode) !void {
     // validate node structure
     switch (node.node_type) {
         .command => {
-            if (node.children.len == 0) return error.emptycommand;
+            if (node.children.len == 0) return error.EmptyCommand;
             // first child must be a word (command name)
             if (node.children[0].node_type != .word and node.children[0].node_type != .string) {
-                return error.invalidcommandname;
+                return error.InvalidCommandName;
             }
         },
         .if_statement => {
-            if (node.children.len < 2) return error.invalidif;
+            if (node.children.len < 2) return error.InvalidIf;
         },
         .while_loop, .until_loop => {
-            if (node.children.len != 2) return error.invalidloop;
+            if (node.children.len != 2) return error.InvalidLoop;
         },
         .for_loop => {
-            if (node.children.len < 3) return error.invalidfor;
+            if (node.children.len < 3) return error.InvalidFor;
         },
         .pipeline => {
-            if (node.children.len < 2) return error.invalidpipeline;
+            if (node.children.len < 2) return error.InvalidPipeline;
         },
         else => {},
     }

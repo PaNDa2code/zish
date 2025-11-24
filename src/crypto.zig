@@ -1,0 +1,497 @@
+// crypto.zig - encryption for history at rest
+const std = @import("std");
+const crypto = std.crypto;
+const fs = std.fs;
+const posix = std.posix;
+
+const AEAD = crypto.aead.chacha_poly.XChaCha20Poly1305;
+const Blake2b256 = crypto.hash.blake2.Blake2b256;
+
+pub const KEY_LEN = 32;
+pub const NONCE_LEN = AEAD.nonce_length; // 24 bytes for XChaCha20
+pub const TAG_LEN = AEAD.tag_length; // 16 bytes
+
+/// crypto context holds encryption key
+pub const CryptoContext = struct {
+    key: [KEY_LEN]u8,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) !CryptoContext {
+        var key: [KEY_LEN]u8 = undefined;
+
+        // check if password mode is enabled (and not bypassed)
+        const bypass_password = posix.getenv("ZISH_BYPASS_PASSWORD") != null;
+        const stdin_is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+
+        // skip password prompt if stdin is not a tty (eg. in tests or pipes)
+        if (isPasswordModeEnabled(allocator) and !bypass_password and stdin_is_tty) {
+            // try up to 3 times to get the password
+            var attempts: u8 = 0;
+            while (attempts < 3) : (attempts += 1) {
+                // prompt for password
+                const password = try promptPassword(allocator, "Enter history password: ");
+                defer allocator.free(password);
+
+                if (password.len == 0) {
+                    return error.EmptyPassword;
+                }
+
+                // derive key from password
+                key = try deriveKeyFromPassword(password, allocator);
+
+                // validate by trying to read the history file
+                if (validateKey(key, allocator)) {
+                    break;
+                } else {
+                    const remaining = 2 - attempts;
+                    if (remaining > 0) {
+                        const stdout_fd = std.posix.STDOUT_FILENO;
+                        const msg = try std.fmt.allocPrint(allocator, "Wrong password. {d} attempt(s) remaining.\n", .{remaining});
+                        defer allocator.free(msg);
+                        _ = std.posix.write(stdout_fd, msg) catch {};
+                    } else {
+                        // 3 failed attempts - offer to reset
+                        const stdout_fd = std.posix.STDOUT_FILENO;
+                        _ = std.posix.write(stdout_fd, "\nToo many failed attempts.\n") catch {};
+                        _ = std.posix.write(stdout_fd, "Reset history and start fresh? (yes/no): ") catch {};
+
+                        var response_buf: [256]u8 = undefined;
+                        const bytes_read = std.posix.read(std.posix.STDIN_FILENO, &response_buf) catch 0;
+                        const response = std.mem.trim(u8, response_buf[0..bytes_read], " \t\r\n");
+
+                        if (std.mem.eql(u8, response, "yes") or std.mem.eql(u8, response, "y")) {
+                            try resetHistory(allocator);
+                            _ = std.posix.write(stdout_fd, "History reset. Starting fresh.\n") catch {};
+
+                            // generate new random key
+                            crypto.random.bytes(&key);
+                            try saveKey(key);
+                            break;
+                        } else {
+                            return error.TooManyFailedAttempts;
+                        }
+                    }
+                }
+            }
+        } else {
+            // try to load existing key, or generate new one
+            if (loadKey(&key)) {
+                // existing key loaded
+            } else |_| {
+                // generate new random key
+                crypto.random.bytes(&key);
+                try saveKey(key);
+            }
+        }
+
+        return CryptoContext{
+            .key = key,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *CryptoContext) void {
+        // zero sensitive data
+        @memset(&self.key, 0);
+    }
+
+    /// encrypt plaintext with random nonce
+    /// returns: nonce ++ ciphertext ++ tag
+    pub fn encrypt(
+        self: *CryptoContext,
+        plaintext: []const u8,
+        aad: []const u8,
+    ) ![]u8 {
+        // allocate: nonce + ciphertext + tag
+        const total_len = NONCE_LEN + plaintext.len + TAG_LEN;
+        var result = try self.allocator.alloc(u8, total_len);
+        errdefer self.allocator.free(result);
+
+        // generate random nonce
+        var nonce: [NONCE_LEN]u8 = undefined;
+        crypto.random.bytes(&nonce);
+
+        // copy nonce to output
+        @memcpy(result[0..NONCE_LEN], &nonce);
+
+        // encrypt
+        const ciphertext = result[NONCE_LEN .. NONCE_LEN + plaintext.len];
+        const tag = result[NONCE_LEN + plaintext.len ..][0..TAG_LEN];
+
+        AEAD.encrypt(ciphertext, tag, plaintext, aad, nonce, self.key);
+
+        return result;
+    }
+
+    /// decrypt nonce ++ ciphertext ++ tag
+    pub fn decrypt(
+        self: *CryptoContext,
+        encrypted: []const u8,
+        aad: []const u8,
+    ) ![]u8 {
+        if (encrypted.len < NONCE_LEN + TAG_LEN) {
+            return error.CiphertextTooShort;
+        }
+
+        // extract nonce
+        const nonce = encrypted[0..NONCE_LEN].*;
+
+        // extract ciphertext and tag
+        const ciphertext_len = encrypted.len - NONCE_LEN - TAG_LEN;
+        const ciphertext = encrypted[NONCE_LEN .. NONCE_LEN + ciphertext_len];
+        const tag = encrypted[encrypted.len - TAG_LEN ..][0..TAG_LEN].*;
+
+        // allocate plaintext
+        const plaintext = try self.allocator.alloc(u8, ciphertext_len);
+        errdefer self.allocator.free(plaintext);
+
+        // decrypt and authenticate
+        AEAD.decrypt(plaintext, ciphertext, tag, aad, nonce, self.key) catch {
+            return error.AuthenticationFailed;
+        };
+
+        return plaintext;
+    }
+};
+
+/// get path to key file: ~/.config/zish/key
+fn getKeyPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+    return std.fmt.allocPrint(allocator, "{s}/.config/zish/key", .{home});
+}
+
+/// load existing key from disk
+fn loadKey(key: *[KEY_LEN]u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_path = try getKeyPath(allocator);
+
+    const file = try fs.openFileAbsolute(key_path, .{});
+    defer file.close();
+
+    const bytes_read = try file.readAll(key);
+    if (bytes_read != KEY_LEN) {
+        return error.InvalidKeyFile;
+    }
+}
+
+/// save key to disk with secure permissions (public version for chpw)
+pub fn saveKeyDirect(key: [KEY_LEN]u8) !void {
+    try saveKey(key);
+}
+
+/// save key to disk with secure permissions
+fn saveKey(key: [KEY_LEN]u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_path = try getKeyPath(allocator);
+
+    // ensure directory exists
+    if (std.fs.path.dirname(key_path)) |dir| {
+        fs.makeDirAbsolute(dir) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+
+    // create file with secure permissions
+    const file = try fs.createFileAbsolute(key_path, .{
+        .mode = 0o600, // user read/write only
+    });
+    defer file.close();
+
+    try file.writeAll(&key);
+    try file.sync(); // ensure it hits disk
+}
+
+/// prompt for password with echo disabled
+pub fn promptPassword(allocator: std.mem.Allocator, prompt_text: []const u8) ![]u8 {
+    const stdin_fd = std.posix.STDIN_FILENO;
+    const stdout_fd = std.posix.STDOUT_FILENO;
+
+    // save original termios
+    const original_termios = try std.posix.tcgetattr(stdin_fd);
+
+    // disable echo
+    var termios = original_termios;
+    termios.lflag.ECHO = false;
+    try std.posix.tcsetattr(stdin_fd, .NOW, termios);
+
+    // restore on exit
+    defer std.posix.tcsetattr(stdin_fd, .NOW, original_termios) catch {};
+
+    // show prompt
+    _ = std.posix.write(stdout_fd, prompt_text) catch return error.WriteFailed;
+
+    // read password
+    var password_buf: [256]u8 = undefined;
+    const bytes_read = std.posix.read(stdin_fd, &password_buf) catch return error.ReadFailed;
+    const password_line = password_buf[0..bytes_read];
+
+    // print newline since echo was disabled
+    _ = std.posix.write(stdout_fd, "\n") catch {};
+
+    // trim whitespace (including newline)
+    const password = std.mem.trim(u8, password_line, " \t\r\n");
+
+    return try allocator.dupe(u8, password);
+}
+
+/// derive key from password using Argon2id
+pub fn deriveKeyFromPassword(password: []const u8, allocator: std.mem.Allocator) ![KEY_LEN]u8 {
+    const Argon2 = crypto.pwhash.argon2;
+
+    // load or generate salt
+    const salt = try loadOrGenerateSalt(allocator);
+
+    // derive key using argon2id
+    var key: [KEY_LEN]u8 = undefined;
+    try Argon2.kdf(
+        allocator,
+        &key,
+        password,
+        &salt,
+        .{ .t = 3, .m = 65536, .p = 4 }, // moderate security params
+        .argon2id,
+    );
+
+    return key;
+}
+
+fn getHistoryDirPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+    return std.fmt.allocPrint(allocator, "{s}/.config/zish/history.d", .{home});
+}
+
+fn getPasswordModePath(allocator: std.mem.Allocator) ![]u8 {
+    const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+    return std.fmt.allocPrint(allocator, "{s}/.config/zish/password_mode", .{home});
+}
+
+/// validate that a key can decrypt the history file
+fn validateKey(key: [KEY_LEN]u8, allocator: std.mem.Allocator) bool {
+    const history_dir = getHistoryDirPath(allocator) catch return true; // assume valid if can't check
+    defer allocator.free(history_dir);
+
+    const log_path = std.fmt.allocPrint(allocator, "{s}/current.log.enc", .{history_dir}) catch return true;
+    defer allocator.free(log_path);
+
+    // if file doesn't exist, key is "valid" (nothing to validate)
+    const file = fs.openFileAbsolute(log_path, .{}) catch return true;
+    defer file.close();
+
+    // try to read and decrypt first entry
+    var header: [40]u8 = undefined; // EntryHeader size
+    const bytes_read = file.readAll(&header) catch return false;
+    if (bytes_read < 40) return true; // empty file is valid
+
+    // extract entry length from header
+    const entry_len = std.mem.readInt(u16, header[6..8], .little);
+    if (entry_len == 0) return false;
+
+    // read encrypted data
+    const encrypted = allocator.alloc(u8, entry_len) catch return false;
+    defer allocator.free(encrypted);
+
+    const data_read = file.readAll(encrypted) catch return false;
+    if (data_read < entry_len) return false;
+
+    // create crypto context with the key
+    var ctx = CryptoContext{ .key = key, .allocator = allocator };
+
+    // create AAD (same as during encryption)
+    var aad_buf: [24]u8 = undefined;
+    @memcpy(aad_buf[0..4], header[0..4]);
+    aad_buf[4] = header[4]; // version
+    aad_buf[5] = header[5]; // reserved
+    aad_buf[6] = header[8]; // instance
+    aad_buf[7] = 0; // padding
+    std.mem.writeInt(u64, aad_buf[8..16], std.mem.readInt(u64, header[9..17], .little), .little); // sequence
+    std.mem.writeInt(u64, aad_buf[16..24], std.mem.readInt(u64, header[17..25], .little), .little); // timestamp
+
+    // try to decrypt
+    const plaintext = ctx.decrypt(encrypted, &aad_buf) catch return false;
+    allocator.free(plaintext);
+
+    return true;
+}
+
+/// reset history by renaming the encrypted file and removing password mode
+fn resetHistory(allocator: std.mem.Allocator) !void {
+    const history_dir = try getHistoryDirPath(allocator);
+    defer allocator.free(history_dir);
+
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/current.log.enc", .{history_dir});
+    defer allocator.free(log_path);
+
+    // rename old history file with timestamp
+    const timestamp = std.time.timestamp();
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/corrupted_{d}.log.enc", .{ history_dir, timestamp });
+    defer allocator.free(backup_path);
+
+    fs.renameAbsolute(log_path, backup_path) catch |err| {
+        if (err != error.FileNotFound) return err;
+    };
+
+    // disable password mode
+    try disablePasswordMode(allocator);
+}
+
+pub fn isPasswordModeEnabled(allocator: std.mem.Allocator) bool {
+    const path = getPasswordModePath(allocator) catch return false;
+    defer allocator.free(path);
+
+    const file = fs.openFileAbsolute(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
+pub fn enablePasswordMode(allocator: std.mem.Allocator) !void {
+    const path = try getPasswordModePath(allocator);
+    defer allocator.free(path);
+
+    if (std.fs.path.dirname(path)) |dir| {
+        fs.makeDirAbsolute(dir) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+
+    const file = try fs.createFileAbsolute(path, .{ .mode = 0o600 });
+    defer file.close();
+    try file.writeAll("1");
+}
+
+pub fn disablePasswordMode(allocator: std.mem.Allocator) !void {
+    const path = try getPasswordModePath(allocator);
+    defer allocator.free(path);
+
+    fs.deleteFileAbsolute(path) catch |err| {
+        if (err != error.FileNotFound) return err;
+    };
+}
+
+fn getSaltPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+    return std.fmt.allocPrint(allocator, "{s}/.config/zish/salt", .{home});
+}
+
+fn loadOrGenerateSalt(allocator: std.mem.Allocator) ![16]u8 {
+    const salt_path = try getSaltPath(allocator);
+    defer allocator.free(salt_path);
+
+    // try to load existing salt
+    if (fs.openFileAbsolute(salt_path, .{})) |file| {
+        defer file.close();
+        var salt: [16]u8 = undefined;
+        const bytes_read = try file.readAll(&salt);
+        if (bytes_read == 16) {
+            return salt;
+        }
+    } else |_| {}
+
+    // generate new salt
+    var salt: [16]u8 = undefined;
+    crypto.random.bytes(&salt);
+
+    // save to disk
+    if (std.fs.path.dirname(salt_path)) |dir| {
+        fs.makeDirAbsolute(dir) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+
+    const file = try fs.createFileAbsolute(salt_path, .{
+        .mode = 0o600,
+    });
+    defer file.close();
+
+    try file.writeAll(&salt);
+    try file.sync();
+
+    return salt;
+}
+
+// tests
+test "encrypt and decrypt roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try CryptoContext.init(allocator);
+    defer ctx.deinit();
+
+    const plaintext = "secret history command";
+    const aad = "header data";
+
+    const encrypted = try ctx.encrypt(plaintext, aad);
+    defer allocator.free(encrypted);
+
+    const decrypted = try ctx.decrypt(encrypted, aad);
+    defer allocator.free(decrypted);
+
+    try std.testing.expectEqualStrings(plaintext, decrypted);
+}
+
+test "decrypt with wrong aad fails" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try CryptoContext.init(allocator);
+    defer ctx.deinit();
+
+    const plaintext = "secret history command";
+    const aad = "correct header";
+    const wrong_aad = "wrong header";
+
+    const encrypted = try ctx.encrypt(plaintext, aad);
+    defer allocator.free(encrypted);
+
+    const result = ctx.decrypt(encrypted, wrong_aad);
+    try std.testing.expectError(error.AuthenticationFailed, result);
+}
+
+test "decrypt corrupted ciphertext fails" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try CryptoContext.init(allocator);
+    defer ctx.deinit();
+
+    const plaintext = "secret history command";
+    const aad = "header";
+
+    var encrypted = try ctx.encrypt(plaintext, aad);
+    defer allocator.free(encrypted);
+
+    // corrupt a byte in the middle
+    encrypted[NONCE_LEN + 5] ^= 0xff;
+
+    const result = ctx.decrypt(encrypted, aad);
+    try std.testing.expectError(error.AuthenticationFailed, result);
+}
+
+test "key persists across context recreations" {
+    const allocator = std.testing.allocator;
+
+    const plaintext = "test data";
+    const aad = "header";
+
+    // first context - creates key
+    var encrypted: []u8 = undefined;
+    {
+        var ctx1 = try CryptoContext.init(allocator);
+        defer ctx1.deinit();
+        encrypted = try ctx1.encrypt(plaintext, aad);
+    }
+    defer allocator.free(encrypted);
+
+    // second context - loads same key
+    {
+        var ctx2 = try CryptoContext.init(allocator);
+        defer ctx2.deinit();
+
+        const decrypted = try ctx2.decrypt(encrypted, aad);
+        defer allocator.free(decrypted);
+
+        try std.testing.expectEqualStrings(plaintext, decrypted);
+    }
+}

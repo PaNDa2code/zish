@@ -81,7 +81,8 @@ pub const InternedString = struct {
 // token types for lexer
 pub const TokenType = enum {
     Word,
-    String,
+    String, // single-quoted (no expansion)
+    DoubleQuotedString, // double-quoted (with expansion)
     Number,
     Semicolon,
     Pipe,

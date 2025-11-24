@@ -1,0 +1,47 @@
+PREFIX ?= /usr/local
+BINDIR = $(PREFIX)/bin
+SHELL_PATH = $(BINDIR)/zish
+
+.PHONY: all build install uninstall add-shell remove-shell clean test test-verbose
+
+all: build
+
+build:
+	zig build --release=safe
+
+install: build
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 755 zig-out/bin/zish $(DESTDIR)$(SHELL_PATH)
+	@echo "installed zish to $(SHELL_PATH)"
+	@echo "run 'sudo make add-shell' to add to /etc/shells"
+
+add-shell:
+	@if ! grep -q "^$(SHELL_PATH)$$" /etc/shells; then \
+		echo "$(SHELL_PATH)" >> /etc/shells; \
+		echo "added $(SHELL_PATH) to /etc/shells"; \
+	else \
+		echo "$(SHELL_PATH) already in /etc/shells"; \
+	fi
+
+remove-shell:
+	@if grep -q "^$(SHELL_PATH)$$" /etc/shells; then \
+		sed -i "\|^$(SHELL_PATH)$$|d" /etc/shells; \
+		echo "removed $(SHELL_PATH) from /etc/shells"; \
+	else \
+		echo "$(SHELL_PATH) not in /etc/shells"; \
+	fi
+
+uninstall: remove-shell
+	rm -f $(DESTDIR)$(SHELL_PATH)
+	@echo "uninstalled zish"
+
+clean:
+	rm -rf zig-out .zig-cache
+
+test: build
+	@command -v shellspec >/dev/null 2>&1 || { echo "shellspec not found. install from: https://shellspec.info"; exit 1; }
+	shellspec
+
+test-verbose: build
+	@command -v shellspec >/dev/null 2>&1 || { echo "shellspec not found. install from: https://shellspec.info"; exit 1; }
+	shellspec --format documentation

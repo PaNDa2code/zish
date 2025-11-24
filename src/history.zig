@@ -3,6 +3,12 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const crypto_mod = @import("crypto.zig");
+const log_mod = @import("history_log.zig");
+
+const CryptoContext = crypto_mod.CryptoContext;
+const LogWriter = log_mod.LogWriter;
+const LogReader = log_mod.LogReader;
 
 // Security constants - prevent DoS attacks
 const MAX_COMMAND_LENGTH = 2048; // Reasonable limit for shell commands
@@ -20,9 +26,14 @@ const HistoryEntry = struct {
     flags: u8, // Success flag, etc.
 
     const SUCCESSFUL_FLAG: u8 = 1;
+    const BOOKMARKED_FLAG: u8 = 2;
 
     pub fn isSuccessful(self: HistoryEntry) bool {
         return (self.flags & SUCCESSFUL_FLAG) != 0;
+    }
+
+    pub fn isBookmarked(self: HistoryEntry) bool {
+        return (self.flags & BOOKMARKED_FLAG) != 0;
     }
 };
 
@@ -32,6 +43,12 @@ pub const History = struct {
     string_pool: []u8, // Contiguous string storage for cache efficiency
     string_pool_used: usize,
     hash_map: std.HashMap(u64, u32, std.hash_map.AutoContext(u64), 80), // For O(1) deduplication
+    bookmarks_path: ?[]const u8, // Path to bookmarks file (deprecated, will be removed)
+
+    // encrypted persistence
+    crypto: *CryptoContext,
+    log_writer: LogWriter,
+    dirty: bool, // needs save
 
     const Self = @This();
 
@@ -50,20 +67,61 @@ pub const History = struct {
         errdefer hash_map.deinit();
         try hash_map.ensureTotalCapacity(DEFAULT_CAPACITY);
 
+        // Set up bookmarks path (~/.config/zish/bookmarks)
+        const bookmarks_path = blk: {
+            const home = std.posix.getenv("HOME") orelse break :blk null;
+            const path = std.fmt.allocPrint(allocator, "{s}/.config/zish/bookmarks", .{home}) catch break :blk null;
+            break :blk path;
+        };
+
+        // init crypto (allocate on heap so pointer stays valid)
+        const crypto = try allocator.create(CryptoContext);
+        errdefer allocator.destroy(crypto);
+        crypto.* = try CryptoContext.init(allocator);
+        errdefer crypto.deinit();
+
+        // init log writer
+        var log_writer = try LogWriter.init(allocator, crypto);
+        errdefer log_writer.deinit();
+
         history.* = .{
             .allocator = allocator,
             .entries = entries,
             .string_pool = string_pool,
             .string_pool_used = 0,
             .hash_map = hash_map,
+            .bookmarks_path = bookmarks_path,
+            .crypto = crypto,
+            .log_writer = log_writer,
+            .dirty = false,
         };
+
+        // load encrypted history from disk
+        history.load() catch |err| {
+            std.log.warn("failed to load encrypted history: {}", .{err});
+        };
+
+        // load old bookmarks for migration
+        history.loadBookmarks() catch {};
+
         return history;
     }
 
     pub fn deinit(self: *Self) void {
+        // save any pending changes
+        self.save() catch |err| {
+            std.log.warn("failed to save history on exit: {}", .{err});
+        };
+
+        self.log_writer.deinit();
+        self.crypto.deinit();
+        self.allocator.destroy(self.crypto);
         self.hash_map.deinit();
         self.entries.deinit(self.allocator);
         self.allocator.free(self.string_pool);
+        if (self.bookmarks_path) |path| {
+            self.allocator.free(path);
+        }
         self.allocator.destroy(self);
     }
 
@@ -117,6 +175,28 @@ pub const History = struct {
         const entry_index: u32 = @intCast(self.entries.items.len);
         try self.entries.append(self.allocator, entry);
         try self.hash_map.put(command_hash, entry_index);
+
+        // mark dirty for save
+        self.dirty = true;
+
+        // save immediately (append-only, fast)
+        try self.saveEntry(entry);
+    }
+
+    /// save single entry immediately (append-only)
+    fn saveEntry(self: *Self, entry: HistoryEntry) !void {
+        const command = self.getCommand(entry);
+
+        const log_entry = log_mod.EntryData{
+            .command_hash = entry.command_hash,
+            .command = command,
+            .exit_code = entry.exit_code,
+            .flags = entry.flags,
+            .frequency = entry.frequency,
+        };
+
+        try self.log_writer.append(log_entry);
+        self.dirty = false; // just saved
     }
 
     // Security: Validate that command contains only safe characters
@@ -169,6 +249,90 @@ pub const History = struct {
         const start = entry.command_offset;
         const end = start + entry.command_len;
         return self.string_pool[start..end];
+    }
+
+    pub fn toggleBookmark(self: *Self, entry_index: usize) !void {
+        if (entry_index >= self.entries.items.len) return;
+
+        var entry = &self.entries.items[entry_index];
+        entry.flags ^= HistoryEntry.BOOKMARKED_FLAG;
+
+        // Save bookmarks to file
+        try self.saveBookmarks();
+    }
+
+    pub fn isEntryBookmarked(self: *Self, entry_index: usize) bool {
+        if (entry_index >= self.entries.items.len) return false;
+        return self.entries.items[entry_index].isBookmarked();
+    }
+
+    fn loadBookmarks(self: *Self) !void {
+        const path = self.bookmarks_path orelse return;
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch return;
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return;
+        defer self.allocator.free(content);
+
+        // Parse bookmarks - each line is a command
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            // Add command as bookmarked
+            const command_hash = std.hash.Wyhash.hash(0, line);
+
+            // Check if already exists
+            if (self.hash_map.get(command_hash)) |existing_index| {
+                // Mark as bookmarked
+                self.entries.items[existing_index].flags |= HistoryEntry.BOOKMARKED_FLAG;
+            } else {
+                // Add new entry as bookmarked
+                if (self.string_pool_used + line.len > self.string_pool.len) continue;
+
+                const command_offset: u32 = @intCast(self.string_pool_used);
+                @memcpy(self.string_pool[self.string_pool_used..self.string_pool_used + line.len], line);
+                self.string_pool_used += line.len;
+
+                const entry = HistoryEntry{
+                    .command_hash = command_hash,
+                    .command_offset = command_offset,
+                    .command_len = @intCast(line.len),
+                    .frequency = 1,
+                    .timestamp = @intCast(std.time.timestamp()),
+                    .exit_code = 0,
+                    .flags = HistoryEntry.SUCCESSFUL_FLAG | HistoryEntry.BOOKMARKED_FLAG,
+                };
+
+                const entry_index: u32 = @intCast(self.entries.items.len);
+                try self.entries.append(self.allocator, entry);
+                try self.hash_map.put(command_hash, entry_index);
+            }
+        }
+    }
+
+    fn saveBookmarks(self: *Self) !void {
+        const path = self.bookmarks_path orelse return;
+
+        // Ensure directory exists
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.makeDirAbsolute(dir) catch |err| {
+                if (err != error.PathAlreadyExists) return err;
+            };
+        }
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+
+        // Write all bookmarked commands
+        for (self.entries.items) |entry| {
+            if (entry.isBookmarked()) {
+                const cmd = self.getCommand(entry);
+                try file.writeAll(cmd);
+                try file.writeAll("\n");
+            }
+        }
     }
 
     pub fn fuzzySearch(self: *Self, query: []const u8, allocator: std.mem.Allocator) ![]FuzzyMatch {
@@ -226,6 +390,119 @@ pub const History = struct {
         const result_count = @min(matches.items.len, 10);
         matches.shrinkRetainingCapacity(result_count);
         return try matches.toOwnedSlice(allocator);
+    }
+
+    /// save all entries to encrypted log
+    pub fn save(self: *Self) !void {
+        if (!self.dirty) return; // nothing to save
+
+        // write all current entries
+        for (self.entries.items) |entry| {
+            const command = self.getCommand(entry);
+
+            const log_entry = log_mod.EntryData{
+                .command_hash = entry.command_hash,
+                .command = command,
+                .exit_code = entry.exit_code,
+                .flags = entry.flags,
+                .frequency = entry.frequency,
+            };
+
+            try self.log_writer.append(log_entry);
+        }
+
+        self.dirty = false;
+    }
+
+    /// load entries from encrypted log and merge with in-memory
+    fn load(self: *Self) !void {
+        var reader = try LogReader.init(self.allocator, self.crypto);
+        defer reader.deinit();
+
+        const entries = try reader.readAll();
+        defer {
+            for (entries) |entry| {
+                self.allocator.free(entry.command);
+            }
+            self.allocator.free(entries);
+        }
+
+        // merge with in-memory entries
+        for (entries) |entry| {
+            self.mergeEntry(entry) catch |err| {
+                std.log.warn("failed to merge entry: {}", .{err});
+            };
+        }
+    }
+
+    /// re-encrypt all history with a new key
+    pub fn reEncryptWithKey(self: *Self, new_key: [32]u8) !void {
+        const fs = std.fs;
+
+        // update crypto context with new key
+        self.crypto.key = new_key;
+
+        // get log file path
+        const log_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/current.log.enc",
+            .{self.log_writer.log_dir},
+        );
+        defer self.allocator.free(log_path);
+
+        // delete old encrypted log
+        fs.deleteFileAbsolute(log_path) catch |err| {
+            if (err != error.FileNotFound) return err;
+        };
+
+        // reset sequence counter
+        self.log_writer.sequence = 0;
+
+        // re-save all entries with new key
+        for (self.entries.items) |entry| {
+            try self.saveEntry(entry);
+        }
+    }
+
+    /// merge single entry from disk into memory
+    fn mergeEntry(self: *Self, disk_entry: log_mod.EntryData) !void {
+        // check if exists in memory
+        if (self.hash_map.get(disk_entry.command_hash)) |existing_index| {
+            // merge: higher frequency + newer timestamp wins
+            var memory_entry = &self.entries.items[existing_index];
+
+            memory_entry.frequency = @max(memory_entry.frequency, disk_entry.frequency);
+            const current_time: u32 = @intCast(std.time.timestamp());
+            memory_entry.timestamp = @max(memory_entry.timestamp, current_time);
+            memory_entry.flags |= disk_entry.flags; // union of flags
+            memory_entry.exit_code = disk_entry.exit_code;
+        } else {
+            // add new entry from disk
+            if (self.string_pool_used + disk_entry.command.len > self.string_pool.len) {
+                return error.StringPoolFull;
+            }
+
+            const command_offset: u32 = @intCast(self.string_pool_used);
+            @memcpy(
+                self.string_pool[self.string_pool_used .. self.string_pool_used + disk_entry.command.len],
+                disk_entry.command,
+            );
+            self.string_pool_used += disk_entry.command.len;
+
+            const entry = HistoryEntry{
+                .command_hash = disk_entry.command_hash,
+                .command_offset = command_offset,
+                .command_len = @intCast(disk_entry.command.len),
+                .frequency = disk_entry.frequency,
+                .timestamp = @intCast(std.time.timestamp()),
+                .exit_code = disk_entry.exit_code,
+                .flags = disk_entry.flags,
+            };
+
+            const entry_index: u32 = @intCast(self.entries.items.len);
+            try self.entries.append(self.allocator, entry);
+            try self.hash_map.put(disk_entry.command_hash, entry_index);
+        }
     }
 };
 

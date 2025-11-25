@@ -238,6 +238,7 @@ pub const Parser = struct {
             .LeftBrace => self.parsegroup(),
             .LeftParen => self.parsesubshell(),
             .Function => self.parsefunction(),
+            .TestOpen => self.parsetest(),
             else => self.parsesimplecommand(),
         };
     }
@@ -248,6 +249,27 @@ pub const Parser = struct {
         while (self.current_token.ty != .Eof) {
             switch (self.current_token.ty) {
                 .Word => {
+                    // Check for POSIX function definition: name() { ... }
+                    if (words.items.len == 0 and self.peek_token.ty == .LeftParen) {
+                        const name_token = self.current_token;
+                        try self.nextToken(); // consume name
+                        if (self.current_token.ty == .LeftParen) {
+                            try self.nextToken(); // consume '('
+                            if (self.current_token.ty == .RightParen) {
+                                try self.nextToken(); // consume ')'
+                                if (self.current_token.ty == .LeftBrace) {
+                                    // This is a function definition
+                                    const body = try self.parsegroup();
+                                    return self.builder.createfunctiondef(name_token.value, body, name_token.line, name_token.column);
+                                }
+                            }
+                        }
+                        // Not a function definition, treat as command - restore parsing
+                        const word = try self.builder.createword(name_token.value, name_token.line, name_token.column);
+                        try words.append(self.builder.arena.allocator(), word);
+                        continue;
+                    }
+
                     // Check if this word is an assignment (contains =)
                     // Only treat as assignment if it's the first word
                     if (words.items.len == 0 and std.mem.indexOfScalar(u8, self.current_token.value, '=') != null) {
@@ -609,6 +631,56 @@ pub const Parser = struct {
         const body = try self.parsegroup();
 
         return self.builder.createfunctiondef(name, body, func_token.line, func_token.column);
+    }
+
+    fn parsetest(self: *Self) parsererror!*const ast.AstNode {
+        const test_token = self.current_token;
+        try self.nextToken(); // consume '[['
+
+        // collect all words until ]]
+        var words = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 16);
+
+        while (self.current_token.ty != .TestClose and self.current_token.ty != .Eof) {
+            switch (self.current_token.ty) {
+                .Word, .String, .DoubleQuotedString, .ParameterExpansion, .CommandSubstitution => {
+                    const word = try self.parseword();
+                    try words.append(self.builder.arena.allocator(), word);
+                },
+                .NewLine => {
+                    try self.nextToken();
+                },
+                else => {
+                    // unexpected token in test expression
+                    return error.UnexpectedToken;
+                },
+            }
+        }
+
+        if (self.current_token.ty != .TestClose) {
+            return error.UnexpectedToken; // expected ]]
+        }
+        try self.nextToken(); // consume ']]'
+
+        // store test expression as space-separated string
+        var expr_buf: [1024]u8 = undefined;
+        var expr_len: usize = 0;
+        for (words.items, 0..) |word, i| {
+            if (i > 0 and expr_len < expr_buf.len) {
+                expr_buf[expr_len] = ' ';
+                expr_len += 1;
+            }
+            const to_copy = @min(word.value.len, expr_buf.len - expr_len);
+            @memcpy(expr_buf[expr_len..][0..to_copy], word.value[0..to_copy]);
+            expr_len += to_copy;
+        }
+
+        return self.builder.createnode(
+            .test_expression,
+            expr_buf[0..expr_len],
+            words.items,
+            test_token.line,
+            test_token.column,
+        );
     }
 };
 

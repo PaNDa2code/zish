@@ -45,6 +45,10 @@ pub const TokenType = enum {
     LeftParen, RightParen,
     LeftBrace, RightBrace,
 
+    // test expressions
+    TestOpen,  // [[
+    TestClose, // ]]
+
     // special
     Semicolon,
     NewLine,
@@ -188,6 +192,8 @@ pub const Lexer = struct {
             ')' => self.handleRightParen(start_line, start_column),
             '{' => self.handleLeftBrace(start_line, start_column),
             '}' => self.handleRightBrace(start_line, start_column),
+            '[' => self.handleLeftBracket(start_line, start_column),
+            ']' => self.handleRightBracket(start_line, start_column),
             '\n' => self.handleNewline(start_line, start_column),
             else => if (std.ascii.isDigit(char))
                 self.handleNumber(start_line, start_column)
@@ -684,6 +690,56 @@ pub const Lexer = struct {
         };
     }
 
+    fn handleLeftBracket(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
+        _ = try self.advance(); // consume first [
+
+        // check for [[ (test open)
+        if (self.peek()) |next| {
+            if (next == '[') {
+                _ = try self.advance(); // consume second [
+                return Token{
+                    .ty = .TestOpen,
+                    .value = "[[",
+                    .line = start_line,
+                    .column = start_column,
+                };
+            }
+        }
+
+        // single [ - treat as word for now (used in glob patterns)
+        return Token{
+            .ty = .Word,
+            .value = "[",
+            .line = start_line,
+            .column = start_column,
+        };
+    }
+
+    fn handleRightBracket(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
+        _ = try self.advance(); // consume first ]
+
+        // check for ]] (test close)
+        if (self.peek()) |next| {
+            if (next == ']') {
+                _ = try self.advance(); // consume second ]
+                return Token{
+                    .ty = .TestClose,
+                    .value = "]]",
+                    .line = start_line,
+                    .column = start_column,
+                };
+            }
+        }
+
+        // single ] - treat as word for now (used in glob patterns)
+        return Token{
+            .ty = .Word,
+            .value = "]",
+            .line = start_line,
+            .column = start_column,
+        };
+    }
+
     fn handleRedirectOutput(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
         _ = try self.advance(); // consume first >
 
@@ -806,7 +862,7 @@ pub const Lexer = struct {
 fn isShellMetacharacter(char: u8) bool {
     return switch (char) {
         ' ', '\t', '\n', '\r', '|', '&', ';', '(', ')', '<', '>',
-        '{', '}', '\'', '"', '`', '$', '\\', '#' => true,
+        '{', '}', '[', ']', '\'', '"', '`', '$', '\\', '#' => true,
         else => false,
     };
 }

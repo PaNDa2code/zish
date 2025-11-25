@@ -59,6 +59,7 @@ current_command_len: usize,
 original_termios: ?std.posix.termios = null,
 aliases: std.StringHashMap([]const u8),
 variables: std.StringHashMap([]const u8),
+functions: std.StringHashMap([]const u8), // name -> body source
 last_exit_code: u8 = 0,
 
 // vim clipboard for yank/paste operations
@@ -123,6 +124,7 @@ pub fn init(allocator: std.mem.Allocator) !*Shell {
         .original_termios = null,
         .aliases = std.StringHashMap([]const u8).init(allocator),
         .variables = std.StringHashMap([]const u8).init(allocator),
+        .functions = std.StringHashMap([]const u8).init(allocator),
         .clipboard = clipboard_buffer,
         .clipboard_len = 0,
         .search_mode = false,
@@ -171,6 +173,14 @@ pub fn deinit(self: *Shell) void {
         self.allocator.free(entry.value_ptr.*);
     }
     self.variables.deinit();
+
+    // cleanup functions
+    var fn_it = self.functions.iterator();
+    while (fn_it.next()) |entry| {
+        self.allocator.free(entry.key_ptr.*);
+        self.allocator.free(entry.value_ptr.*);
+    }
+    self.functions.deinit();
 
     if (self.history) |h| h.deinit();
 
@@ -2344,13 +2354,85 @@ fn loadAliases(self: *Shell) !void {
     const contents = try file.readToEndAlloc(self.allocator, 1024 * 1024); // max 1MB
     defer self.allocator.free(contents);
 
-    // parse aliases line by line
+    // parse aliases and functions
     var lines = std.mem.splitSequence(u8, contents, "\n");
+    var in_function = false;
+    var func_name: []const u8 = "";
+    var func_body = std.ArrayListUnmanaged(u8){};
+    defer func_body.deinit(self.allocator);
+    var brace_depth: u32 = 0;
+
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
 
+        // if we're inside a function, collect body
+        if (in_function) {
+            // count braces (skip inside ${...})
+            var i: usize = 0;
+            while (i < line.len) {
+                if (i + 1 < line.len and line[i] == '$' and line[i + 1] == '{') {
+                    // skip to matching }
+                    i += 2;
+                    var param_depth: usize = 1;
+                    while (i < line.len and param_depth > 0) : (i += 1) {
+                        if (line[i] == '{') param_depth += 1;
+                        if (line[i] == '}') param_depth -= 1;
+                    }
+                    // i is now past the closing }, continue to next char
+                    continue;
+                }
+                if (line[i] == '{') brace_depth += 1;
+                if (line[i] == '}') {
+                    if (brace_depth > 0) brace_depth -= 1;
+                }
+                i += 1;
+            }
+
+            if (brace_depth == 0) {
+                // function ended, store it
+                const name_copy = try self.allocator.dupe(u8, func_name);
+                const body_copy = try self.allocator.dupe(u8, func_body.items);
+                try self.functions.put(name_copy, body_copy);
+                in_function = false;
+                func_body.clearRetainingCapacity();
+            } else {
+                // add line to function body
+                try func_body.appendSlice(self.allocator, line);
+                try func_body.append(self.allocator, '\n');
+            }
+            continue;
+        }
+
         // skip empty lines and comments
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        // look for function definitions: name() { or function name {
+        if (std.mem.indexOf(u8, trimmed, "() {")) |paren_pos| {
+            func_name = trimmed[0..paren_pos];
+            in_function = true;
+            brace_depth = 1;
+            // check if body starts on same line after {
+            if (std.mem.indexOf(u8, trimmed, "{")) |brace_pos| {
+                const after_brace = trimmed[brace_pos + 1 ..];
+                const after_trimmed = std.mem.trim(u8, after_brace, " \t");
+                if (after_trimmed.len > 0 and !std.mem.eql(u8, after_trimmed, "}")) {
+                    try func_body.appendSlice(self.allocator, after_trimmed);
+                    try func_body.append(self.allocator, '\n');
+                }
+                // check for closing brace on same line
+                for (after_brace) |c| {
+                    if (c == '}') brace_depth -= 1;
+                }
+                if (brace_depth == 0) {
+                    const name_copy = try self.allocator.dupe(u8, func_name);
+                    const body_copy = try self.allocator.dupe(u8, func_body.items);
+                    try self.functions.put(name_copy, body_copy);
+                    in_function = false;
+                    func_body.clearRetainingCapacity();
+                }
+            }
+            continue;
+        }
 
         // look for alias definitions: alias name=value
         if (std.mem.startsWith(u8, trimmed, "alias ")) {
@@ -2500,30 +2582,129 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
                 }
             }
 
-            const name_start = i;
-            // Find end of variable name (alphanumeric + underscore)
-            while (i < input.len and (std.ascii.isAlphanumeric(input[i]) or input[i] == '_')) {
-                i += 1;
-            }
+            // Handle ${VAR} and ${VAR:-default} syntax
+            if (i < input.len and input[i] == '{') {
+                i += 1; // skip {
+                const name_start = i;
 
-            if (i > name_start) {
+                // Find end of variable name or modifier
+                while (i < input.len and input[i] != '}' and input[i] != ':' and input[i] != '-' and input[i] != '+' and input[i] != '?') {
+                    i += 1;
+                }
+
                 const var_name = input[name_start..i];
 
-                // Look up variable
+                // Check for modifier
+                var modifier: u8 = 0;
+                var has_colon = false;
+                var default_value: []const u8 = "";
+
+                if (i < input.len and input[i] == ':') {
+                    has_colon = true;
+                    i += 1;
+                }
+
+                if (i < input.len and (input[i] == '-' or input[i] == '+' or input[i] == '?')) {
+                    modifier = input[i];
+                    i += 1;
+
+                    // Find the default/alternate value up to closing }
+                    const val_start = i;
+                    var brace_depth: u32 = 1;
+                    while (i < input.len and brace_depth > 0) {
+                        if (input[i] == '{') brace_depth += 1;
+                        if (input[i] == '}') brace_depth -= 1;
+                        if (brace_depth > 0) i += 1;
+                    }
+                    default_value = input[val_start..i];
+                }
+
+                // Skip closing }
+                if (i < input.len and input[i] == '}') i += 1;
+
+                // Look up variable value
+                var var_value: ?[]const u8 = null;
+                var owned_value: ?[]const u8 = null;
+                defer if (owned_value) |v| self.allocator.free(v);
+
                 if (self.variables.get(var_name)) |value| {
-                    try result.appendSlice(self.allocator, value);
+                    var_value = value;
                 } else {
-                    // Try environment variable
                     const env_value = std.process.getEnvVarOwned(self.allocator, var_name) catch null;
                     if (env_value) |val| {
-                        defer self.allocator.free(val);
-                        try result.appendSlice(self.allocator, val);
+                        owned_value = val;
+                        var_value = val;
                     }
-                    // If no variable found, don't expand (leave empty)
+                }
+
+                // Apply modifier
+                const is_set = var_value != null;
+                const is_empty = if (var_value) |v| v.len == 0 else true;
+                const use_default = if (has_colon) !is_set or is_empty else !is_set;
+
+                switch (modifier) {
+                    '-' => {
+                        // ${VAR:-default} or ${VAR-default}
+                        if (use_default) {
+                            // Recursively expand the default value
+                            const expanded_default = try self.expandVariables(default_value);
+                            defer self.allocator.free(expanded_default);
+                            try result.appendSlice(self.allocator, expanded_default);
+                        } else if (var_value) |v| {
+                            try result.appendSlice(self.allocator, v);
+                        }
+                    },
+                    '+' => {
+                        // ${VAR:+alternate} or ${VAR+alternate}
+                        if (!use_default) {
+                            const expanded_alt = try self.expandVariables(default_value);
+                            defer self.allocator.free(expanded_alt);
+                            try result.appendSlice(self.allocator, expanded_alt);
+                        }
+                    },
+                    '?' => {
+                        // ${VAR:?error} or ${VAR?error}
+                        if (use_default) {
+                            try self.stdout().print("zish: {s}: {s}\n", .{ var_name, if (default_value.len > 0) default_value else "parameter not set" });
+                            return error.ParameterNotSet;
+                        } else if (var_value) |v| {
+                            try result.appendSlice(self.allocator, v);
+                        }
+                    },
+                    else => {
+                        // No modifier, just ${VAR}
+                        if (var_value) |v| {
+                            try result.appendSlice(self.allocator, v);
+                        }
+                    },
                 }
             } else {
-                // Just a lone $, keep it
-                try result.append(self.allocator, '$');
+                // Simple $VAR without braces
+                const name_start = i;
+                // Find end of variable name (alphanumeric + underscore)
+                while (i < input.len and (std.ascii.isAlphanumeric(input[i]) or input[i] == '_')) {
+                    i += 1;
+                }
+
+                if (i > name_start) {
+                    const var_name = input[name_start..i];
+
+                    // Look up variable
+                    if (self.variables.get(var_name)) |value| {
+                        try result.appendSlice(self.allocator, value);
+                    } else {
+                        // Try environment variable
+                        const env_value = std.process.getEnvVarOwned(self.allocator, var_name) catch null;
+                        if (env_value) |val| {
+                            defer self.allocator.free(val);
+                            try result.appendSlice(self.allocator, val);
+                        }
+                        // If no variable found, don't expand (leave empty)
+                    }
+                } else {
+                    // Just a lone $, keep it
+                    try result.append(self.allocator, '$');
+                }
             }
         } else if (input[i] == '`') {
             // Handle backtick command substitution

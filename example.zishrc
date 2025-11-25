@@ -1,0 +1,62 @@
+# example ~/.zishrc
+
+# zish options
+set vim on
+set git_prompt on
+
+# core
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias ll='ls -l'
+alias la='ls -la'
+alias v='vi'
+alias c='cat'
+
+# git
+alias g='git'
+alias ga='git add'
+alias gaa='git add -A'
+alias gc='git commit'
+alias gcm='git commit -m'
+alias gca='git commit --amend'
+alias gco='git checkout'
+alias gd='git diff'
+alias gst='git status -sb'
+alias gp='git push'
+alias gl='git pull'
+
+# systemctl
+alias sc='systemctl'
+alias scs='systemctl status'
+alias scr='systemctl restart'
+alias sce='systemctl enable'
+alias scd='systemctl disable'
+alias scu='systemctl --user'
+
+# docker
+alias dr='docker'
+alias dc='docker compose'
+alias dps='docker ps'
+alias dlog='docker logs -f'
+
+# process
+alias psg='pgrep -af'
+
+# rsync
+alias rs='rsync -avh --progress'
+alias rsd='rsync -avh --progress --delete'
+
+# editor
+export EDITOR=${EDITOR:-vim}
+[[ -x /usr/bin/nvim ]] && export EDITOR=nvim
+[[ -x /usr/bin/vim ]] && export EDITOR=vim
+
+# example function
+kb() {
+  local dir=${KB_DIR:-$HOME/notes}
+  [[ -d $dir ]] || mkdir -p $dir
+  $EDITOR $dir/$(date -I).md
+}
+
+# path
+export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH

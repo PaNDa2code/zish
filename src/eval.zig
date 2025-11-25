@@ -18,6 +18,8 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
         .until_loop => evaluateUntil(shell, node),
         .for_loop => evaluateFor(shell, node),
         .subshell => evaluateSubshell(shell, node),
+        .test_expression => evaluateTest(shell, node),
+        .function_def => evaluateFunctionDef(shell, node),
         else => {
             try shell.stdout().writeAll("unsupported AST node type\n");
             return 1;
@@ -88,21 +90,102 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         return 0;
     }
 
+    // `..` builtin: go up one directory
+    if (std.mem.eql(u8, cmd_name, "..")) {
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+        std.posix.chdir("..") catch {
+            try shell.stdout().writeAll("..: cannot go up\n");
+            return 1;
+        };
+        if (cwd.len > 0) try setShellVar(shell, "OLDPWD", cwd);
+        return 0;
+    }
+
+    // `...` builtin: go up two directories
+    if (std.mem.eql(u8, cmd_name, "...")) {
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+        std.posix.chdir("../..") catch {
+            try shell.stdout().writeAll("...: cannot go up\n");
+            return 1;
+        };
+        if (cwd.len > 0) try setShellVar(shell, "OLDPWD", cwd);
+        return 0;
+    }
+
+    // `-` builtin: go to previous directory
+    if (std.mem.eql(u8, cmd_name, "-")) {
+        // check shell variables first, then environment
+        const oldpwd = if (shell.variables.get("OLDPWD")) |v|
+            try shell.allocator.dupe(u8, v)
+        else
+            std.process.getEnvVarOwned(shell.allocator, "OLDPWD") catch {
+                try shell.stdout().writeAll("-: OLDPWD not set\n");
+                return 1;
+            };
+        defer shell.allocator.free(oldpwd);
+
+        // save current dir
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch {
+            try shell.stdout().writeAll("-: could not get current directory\n");
+            return 1;
+        };
+
+        std.posix.chdir(oldpwd) catch {
+            try shell.stdout().print("-: {s}: no such file or directory\n", .{oldpwd});
+            return 1;
+        };
+
+        // update OLDPWD to where we were
+        try setShellVar(shell, "OLDPWD", cwd);
+        try shell.stdout().print("{s}\n", .{oldpwd});
+        return 0;
+    }
+
     if (std.mem.eql(u8, cmd_name, "cd")) {
-        const path = if (expanded_args.items.len > 1) expanded_args.items[1] else blk: {
+        // save current directory to OLDPWD
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+
+        const path = if (expanded_args.items.len > 1) blk: {
+            const arg = expanded_args.items[1];
+            // handle cd -
+            if (std.mem.eql(u8, arg, "-")) {
+                const oldpwd = if (shell.variables.get("OLDPWD")) |v|
+                    try shell.allocator.dupe(u8, v)
+                else
+                    std.process.getEnvVarOwned(shell.allocator, "OLDPWD") catch {
+                        try shell.stdout().writeAll("cd: OLDPWD not set\n");
+                        return 1;
+                    };
+                break :blk oldpwd;
+            }
+            break :blk try shell.allocator.dupe(u8, arg);
+        } else blk: {
             const home = std.process.getEnvVarOwned(shell.allocator, "HOME") catch {
                 try shell.stdout().writeAll("cd: could not get HOME\n");
                 return 1;
             };
-            defer shell.allocator.free(home);
-            break :blk try shell.allocator.dupe(u8, home);
+            break :blk home;
         };
-        defer if (expanded_args.items.len == 1) shell.allocator.free(path);
+        defer shell.allocator.free(path);
 
         std.posix.chdir(path) catch {
             try shell.stdout().print("cd: {s}: no such file or directory\n", .{path});
             return 1;
         };
+
+        // set OLDPWD after successful cd
+        if (cwd.len > 0) {
+            try setShellVar(shell, "OLDPWD", cwd);
+        }
+
+        // print new dir if we used cd -
+        if (expanded_args.items.len > 1 and std.mem.eql(u8, expanded_args.items[1], "-")) {
+            try shell.stdout().print("{s}\n", .{path});
+        }
         return 0;
     }
 
@@ -131,6 +214,21 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             } else {
                 try shell.stdout().print("export: {s}: not a valid identifier\n", .{arg});
                 return 1;
+            }
+        }
+        return 0;
+    }
+
+    // local - same as variable assignment (simplified, no true scope)
+    if (std.mem.eql(u8, cmd_name, "local")) {
+        for (expanded_args.items[1..]) |arg| {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
+                const name = arg[0..eq_pos];
+                const value = arg[eq_pos + 1 ..];
+                try setShellVar(shell, name, value);
+            } else {
+                // local var without value - initialize to empty
+                try setShellVar(shell, arg, "");
             }
         }
         return 0;
@@ -324,6 +422,17 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         }
 
         return 0;
+    }
+
+    // check if it's a function call
+    if (shell.functions.get(cmd_name)) |_| {
+        // call function with remaining arguments
+        return callFunction(shell, cmd_name, expanded_args.items[1..]) catch |err| {
+            if (err == error.FunctionNotFound) {
+                // shouldn't happen since we just checked, but handle anyway
+            }
+            return 1;
+        };
     }
 
     // external command
@@ -647,4 +756,264 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
 pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
     return evaluateAst(shell, node.children[0]);
+}
+
+pub fn evaluateTest(shell: *Shell, node: *const ast.AstNode) !u8 {
+    // expand variables in children
+    var args = try std.ArrayList([]const u8).initCapacity(shell.allocator, 16);
+    defer {
+        for (args.items) |arg| shell.allocator.free(arg);
+        args.deinit(shell.allocator);
+    }
+
+    for (node.children) |child| {
+        const expanded = try shell.expandVariables(child.value);
+        try args.append(shell.allocator, expanded);
+    }
+
+    const result = evaluateTestExpr(args.items);
+    return if (result) 0 else 1;
+}
+
+fn evaluateTestExpr(args: []const []const u8) bool {
+    if (args.len == 0) return false;
+
+    var i: usize = 0;
+    var negate = false;
+
+    // check for negation
+    if (args.len > 0 and std.mem.eql(u8, args[0], "!")) {
+        negate = true;
+        i = 1;
+    }
+
+    if (i >= args.len) return negate;
+
+    const result = evaluateTestPrimary(args[i..]);
+    return if (negate) !result else result;
+}
+
+fn evaluateTestPrimary(args: []const []const u8) bool {
+    if (args.len == 0) return false;
+
+    const first = args[0];
+
+    // unary file tests: -x, -f, -d, -e, -r, -w, -s
+    if (first.len == 2 and first[0] == '-' and args.len >= 2) {
+        const path = args[1];
+        const fs = std.fs;
+
+        return switch (first[1]) {
+            'e' => blk: {
+                // file exists
+                fs.cwd().access(path, .{}) catch break :blk false;
+                break :blk true;
+            },
+            'f' => blk: {
+                // regular file
+                const stat = fs.cwd().statFile(path) catch break :blk false;
+                break :blk stat.kind == .file;
+            },
+            'd' => blk: {
+                // directory
+                const stat = fs.cwd().statFile(path) catch break :blk false;
+                break :blk stat.kind == .directory;
+            },
+            'r' => blk: {
+                // readable
+                fs.cwd().access(path, .{ .mode = .read_only }) catch break :blk false;
+                break :blk true;
+            },
+            'w' => blk: {
+                // writable
+                fs.cwd().access(path, .{ .mode = .write_only }) catch break :blk false;
+                break :blk true;
+            },
+            'x' => blk: {
+                // executable - check if file exists and has execute permission
+                const file = fs.cwd().openFile(path, .{}) catch break :blk false;
+                defer file.close();
+                const stat = file.stat() catch break :blk false;
+                // check execute bit for owner
+                break :blk (stat.mode & 0o100) != 0;
+            },
+            's' => blk: {
+                // file exists and has size > 0
+                const stat = fs.cwd().statFile(path) catch break :blk false;
+                break :blk stat.size > 0;
+            },
+            'z' => blk: {
+                // string is empty (unary on second arg)
+                break :blk args[1].len == 0;
+            },
+            'n' => blk: {
+                // string is non-empty
+                break :blk args[1].len > 0;
+            },
+            else => false,
+        };
+    }
+
+    // binary operators: ==, !=, -eq, -ne, -lt, -gt, -le, -ge
+    if (args.len >= 3) {
+        const left = args[0];
+        const op = args[1];
+        const right = args[2];
+
+        if (std.mem.eql(u8, op, "==") or std.mem.eql(u8, op, "=")) {
+            return std.mem.eql(u8, left, right);
+        } else if (std.mem.eql(u8, op, "!=")) {
+            return !std.mem.eql(u8, left, right);
+        } else if (std.mem.eql(u8, op, "-eq")) {
+            const l = std.fmt.parseInt(i64, left, 10) catch return false;
+            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            return l == r;
+        } else if (std.mem.eql(u8, op, "-ne")) {
+            const l = std.fmt.parseInt(i64, left, 10) catch return false;
+            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            return l != r;
+        } else if (std.mem.eql(u8, op, "-lt")) {
+            const l = std.fmt.parseInt(i64, left, 10) catch return false;
+            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            return l < r;
+        } else if (std.mem.eql(u8, op, "-gt")) {
+            const l = std.fmt.parseInt(i64, left, 10) catch return false;
+            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            return l > r;
+        } else if (std.mem.eql(u8, op, "-le")) {
+            const l = std.fmt.parseInt(i64, left, 10) catch return false;
+            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            return l <= r;
+        } else if (std.mem.eql(u8, op, "-ge")) {
+            const l = std.fmt.parseInt(i64, left, 10) catch return false;
+            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            return l >= r;
+        }
+    }
+
+    // single arg: non-empty string is true
+    return first.len > 0;
+}
+
+fn setShellVar(shell: *Shell, name: []const u8, value: []const u8) !void {
+    const value_copy = try shell.allocator.dupe(u8, value);
+    errdefer shell.allocator.free(value_copy);
+
+    // check if key exists
+    if (shell.variables.getKey(name)) |existing_key| {
+        // key exists, just update value
+        if (try shell.variables.fetchPut(existing_key, value_copy)) |old| {
+            shell.allocator.free(old.value);
+        }
+    } else {
+        // new key, need to dupe it
+        const name_copy = try shell.allocator.dupe(u8, name);
+        try shell.variables.put(name_copy, value_copy);
+    }
+}
+
+pub fn evaluateFunctionDef(shell: *Shell, node: *const ast.AstNode) !u8 {
+    // node.value = function name, node.children[0] = body
+    if (node.children.len == 0) return 1;
+
+    const func_name = node.value;
+    const body = node.children[0];
+
+    // serialize body to string (simple approach - just value for now)
+    var body_buf = std.ArrayListUnmanaged(u8){};
+    defer body_buf.deinit(shell.allocator);
+
+    try serializeAst(shell.allocator, &body_buf, body);
+
+    // store function
+    const name_copy = try shell.allocator.dupe(u8, func_name);
+    errdefer shell.allocator.free(name_copy);
+    const body_copy = try body_buf.toOwnedSlice(shell.allocator);
+
+    if (try shell.functions.fetchPut(name_copy, body_copy)) |old| {
+        // free old value but not key (fetchPut reuses key slot)
+        shell.allocator.free(name_copy); // we don't need the new key copy
+        shell.allocator.free(old.value);
+    }
+
+    return 0;
+}
+
+fn serializeAst(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), node: *const ast.AstNode) !void {
+    switch (node.node_type) {
+        .command => {
+            for (node.children, 0..) |child, i| {
+                if (i > 0) try buf.append(allocator, ' ');
+                try buf.appendSlice(allocator, child.value);
+            }
+        },
+        .list => {
+            for (node.children, 0..) |child, i| {
+                if (i > 0) try buf.appendSlice(allocator, "; ");
+                try serializeAst(allocator, buf, child);
+            }
+        },
+        .pipeline => {
+            for (node.children, 0..) |child, i| {
+                if (i > 0) try buf.appendSlice(allocator, " | ");
+                try serializeAst(allocator, buf, child);
+            }
+        },
+        .logical_and => {
+            if (node.children.len >= 2) {
+                try serializeAst(allocator, buf, node.children[0]);
+                try buf.appendSlice(allocator, " && ");
+                try serializeAst(allocator, buf, node.children[1]);
+            }
+        },
+        .logical_or => {
+            if (node.children.len >= 2) {
+                try serializeAst(allocator, buf, node.children[0]);
+                try buf.appendSlice(allocator, " || ");
+                try serializeAst(allocator, buf, node.children[1]);
+            }
+        },
+        .test_expression => {
+            try buf.appendSlice(allocator, "[[ ");
+            try buf.appendSlice(allocator, node.value);
+            try buf.appendSlice(allocator, " ]]");
+        },
+        else => {
+            try buf.appendSlice(allocator, node.value);
+        },
+    }
+}
+
+pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !u8 {
+    const body = shell.functions.get(name) orelse return error.FunctionNotFound;
+
+    // set positional parameters $1, $2, etc.
+    for (args, 1..) |arg, i| {
+        var num_buf: [16]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
+        try setShellVar(shell, num_str, arg);
+    }
+
+    // execute function body
+    const result = shell.executeCommand(body) catch |err| {
+        // clear positional parameters
+        for (args, 1..) |_, i| {
+            var num_buf: [16]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
+            _ = shell.variables.fetchRemove(num_str);
+        }
+        return err;
+    };
+
+    // clear positional parameters
+    for (args, 1..) |_, i| {
+        var num_buf: [16]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
+        if (shell.variables.fetchRemove(num_str)) |kv| {
+            shell.allocator.free(kv.key);
+            shell.allocator.free(kv.value);
+        }
+    }
+
+    return result;
 }

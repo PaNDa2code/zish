@@ -19,6 +19,7 @@ pub const NodeType = enum {
     function_def,
     assignment,
     redirect, // >, >>, <, 2>, 2>&1
+    test_expression, // [[ ... ]]
     word,
     string,
     number,

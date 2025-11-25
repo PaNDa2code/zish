@@ -346,8 +346,8 @@ pub const Parser = struct {
         if (self.state != .hasboth) return error.InvalidParserState;
 
         const token = self.current_token;
-        try self.nextToken();
 
+        // determine node type before advancing (token still valid)
         const node_type: ast.NodeType = switch (token.ty) {
             .Word => .word,
             .String => .string,
@@ -356,12 +356,17 @@ pub const Parser = struct {
             else => return error.UnexpectedToken,
         };
 
-        return switch (node_type) {
-            .word => self.builder.createword(token.value, token.line, token.column),
-            .string => self.builder.createstring(token.value, token.line, token.column),
-            .number => self.builder.createnode(.number, token.value, &[_]*const ast.AstNode{}, token.line, token.column),
-            else => error.InvalidSyntax,
+        // create node BEFORE nextToken to avoid buffer overwrite
+        // (nextToken may reuse the buffer that token.value points to)
+        const node = switch (node_type) {
+            .word => try self.builder.createword(token.value, token.line, token.column),
+            .string => try self.builder.createstring(token.value, token.line, token.column),
+            .number => try self.builder.createnode(.number, token.value, &[_]*const ast.AstNode{}, token.line, token.column),
+            else => return error.InvalidSyntax,
         };
+
+        try self.nextToken();
+        return node;
     }
 
     // control structure parsing with bounds checking

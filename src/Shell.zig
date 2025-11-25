@@ -1385,11 +1385,13 @@ pub fn enableRawMode(self: *Shell) !void {
 
     // enable bracketed paste mode
     try self.stdout().writeAll("\x1b[?2004h");
+    try self.stdout().flush();
 }
 
 pub fn disableRawMode(self: *Shell) void {
-    // disable bracketed paste mode
+    // disable bracketed paste mode - must flush to avoid leaking into pipes
     self.stdout().writeAll("\x1b[?2004l") catch {};
+    self.stdout().flush() catch {};
 
     if (self.original_termios) |original| {
         const stdin_fd = std.posix.STDIN_FILENO;

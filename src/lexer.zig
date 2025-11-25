@@ -111,6 +111,11 @@ pub const Lexer = struct {
         return self.input[self.position];
     }
 
+    fn peekN(self: *Self, n: usize) ?u8 {
+        if (self.position + n >= self.input.len) return null;
+        return self.input[self.position + n];
+    }
+
     fn advance(self: *Self) !?u8 {
         if (self.position >= self.input.len) return null;
 
@@ -181,14 +186,14 @@ pub const Lexer = struct {
 
         // handle backslash-newline line continuation
         if (char == '\\') {
-            _ = try self.advance(); // consume backslash
-            if (self.peek()) |next| {
+            if (self.peekN(1)) |next| {
                 if (next == '\n') {
+                    _ = try self.advance(); // consume backslash
                     _ = try self.advance(); // skip newline
                     return self.nextToken(); // continue on next line
                 }
             }
-            // backslash not followed by newline - treat as word starting with backslash
+            // backslash followed by other char - treat as word (handleWord handles escapes)
             return self.handleWord(start_line, start_column);
         }
 
@@ -228,6 +233,15 @@ pub const Lexer = struct {
             // bounds check token length
             if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) {
                 return error.TokenTooLong;
+            }
+
+            // handle backslash escapes - \x escapes the next character
+            if (char == '\\') {
+                _ = try self.advance(); // consume backslash
+                if (self.peek()) |_| {
+                    _ = try self.advance(); // consume escaped char
+                }
+                continue;
             }
 
             // handle backticks - skip over `...`
@@ -353,26 +367,20 @@ pub const Lexer = struct {
 
     fn handleSingleQuote(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
         _ = try self.advance(); // skip opening quote
-        var len: usize = 0;
-        const buffer = self.getCurrentBuffer();
+        const start_pos = self.position;
 
+        // single-quoted strings have no escapes, so we can use input slice directly
         while (self.peek()) |char| {
             if (char == '\'') {
-                _ = try self.advance();
+                const end_pos = self.position;
+                _ = try self.advance(); // skip closing quote
                 return Token{
                     .ty = .String,
-                    .value = buffer[0..len],
+                    .value = self.input[start_pos..end_pos],
                     .line = start_line,
                     .column = start_column,
                 };
             }
-
-            if (len >= buffer.len - 1) {
-                return error.StringTooLong;
-            }
-
-            buffer[len] = char;
-            len += 1;
             _ = try self.advance();
         }
 

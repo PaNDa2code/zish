@@ -3,6 +3,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const fs = std.fs;
 const posix = std.posix;
+const history_log = @import("history_log.zig");
 
 const AEAD = crypto.aead.chacha_poly.XChaCha20Poly1305;
 const Blake2b256 = crypto.hash.blake2.Blake2b256;
@@ -55,8 +56,19 @@ pub const CryptoContext = struct {
                         _ = std.posix.write(stdout_fd, "\nToo many failed attempts.\n") catch {};
                         _ = std.posix.write(stdout_fd, "Reset history and start fresh? (yes/no): ") catch {};
 
+                        // enable canonical mode to read full line
+                        const stdin_fd = std.posix.STDIN_FILENO;
+                        const orig_termios = std.posix.tcgetattr(stdin_fd) catch {
+                            return error.TooManyFailedAttempts;
+                        };
+                        var line_termios = orig_termios;
+                        line_termios.lflag.ICANON = true;
+                        line_termios.lflag.ECHO = true;
+                        std.posix.tcsetattr(stdin_fd, .NOW, line_termios) catch {};
+                        defer std.posix.tcsetattr(stdin_fd, .NOW, orig_termios) catch {};
+
                         var response_buf: [256]u8 = undefined;
-                        const bytes_read = std.posix.read(std.posix.STDIN_FILENO, &response_buf) catch 0;
+                        const bytes_read = std.posix.read(stdin_fd, &response_buf) catch 0;
                         const response = std.mem.trim(u8, response_buf[0..bytes_read], " \t\r\n");
 
                         if (std.mem.eql(u8, response, "yes") or std.mem.eql(u8, response, "y")) {
@@ -215,9 +227,10 @@ pub fn promptPassword(allocator: std.mem.Allocator, prompt_text: []const u8) ![]
     // save original termios
     const original_termios = try std.posix.tcgetattr(stdin_fd);
 
-    // disable echo
+    // disable echo but enable canonical mode for line input
     var termios = original_termios;
     termios.lflag.ECHO = false;
+    termios.lflag.ICANON = true; // enable line-buffered input
     try std.posix.tcsetattr(stdin_fd, .NOW, termios);
 
     // restore on exit
@@ -283,34 +296,36 @@ fn validateKey(key: [KEY_LEN]u8, allocator: std.mem.Allocator) bool {
     const file = fs.openFileAbsolute(log_path, .{}) catch return true;
     defer file.close();
 
-    // try to read and decrypt first entry
-    var header: [40]u8 = undefined; // EntryHeader size
-    const bytes_read = file.readAll(&header) catch return false;
-    if (bytes_read < 40) return true; // empty file is valid
+    // read header using proper struct to handle alignment
+    var header: history_log.EntryHeader = undefined;
+    const header_bytes = std.mem.asBytes(&header);
+    const bytes_read = file.readAll(header_bytes) catch return false;
+    if (bytes_read < @sizeOf(history_log.EntryHeader)) return true; // empty/incomplete file is valid
 
-    // extract entry length from header
-    const entry_len = std.mem.readInt(u16, header[6..8], .little);
-    if (entry_len == 0) return false;
+    // validate header magic
+    header.validate() catch return false;
+
+    if (header.entry_len == 0) return false;
 
     // read encrypted data
-    const encrypted = allocator.alloc(u8, entry_len) catch return false;
+    const encrypted = allocator.alloc(u8, header.entry_len) catch return false;
     defer allocator.free(encrypted);
 
     const data_read = file.readAll(encrypted) catch return false;
-    if (data_read < entry_len) return false;
+    if (data_read < header.entry_len) return false;
 
     // create crypto context with the key
     var ctx = CryptoContext{ .key = key, .allocator = allocator };
 
-    // create AAD (same as during encryption)
+    // create AAD (same as during encryption in history_log.zig)
     var aad_buf: [24]u8 = undefined;
-    @memcpy(aad_buf[0..4], header[0..4]);
-    aad_buf[4] = header[4]; // version
-    aad_buf[5] = header[5]; // reserved
-    aad_buf[6] = header[8]; // instance
+    @memcpy(aad_buf[0..4], &header.magic);
+    aad_buf[4] = header.version;
+    aad_buf[5] = header.reserved;
+    aad_buf[6] = header.instance;
     aad_buf[7] = 0; // padding
-    std.mem.writeInt(u64, aad_buf[8..16], std.mem.readInt(u64, header[9..17], .little), .little); // sequence
-    std.mem.writeInt(u64, aad_buf[16..24], std.mem.readInt(u64, header[17..25], .little), .little); // timestamp
+    std.mem.writeInt(u64, aad_buf[8..16], header.sequence, .little);
+    std.mem.writeInt(u64, aad_buf[16..24], header.timestamp, .little);
 
     // try to decrypt
     const plaintext = ctx.decrypt(encrypted, &aad_buf) catch return false;

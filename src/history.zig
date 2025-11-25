@@ -11,7 +11,7 @@ const LogWriter = log_mod.LogWriter;
 const LogReader = log_mod.LogReader;
 
 // Security constants - prevent DoS attacks
-const MAX_COMMAND_LENGTH = 2048; // Reasonable limit for shell commands
+const MAX_COMMAND_LENGTH = types.MAX_COMMAND_LENGTH; // Use consistent limit from types
 const MAX_HISTORY_ENTRIES = 10000; // Hard limit to prevent memory exhaustion
 const DEFAULT_CAPACITY = 1000; // Default size
 const STRING_POOL_SIZE = 256 * 1024; // 256KB string pool for cache efficiency

@@ -293,6 +293,20 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     const pipes = try shell.allocator.alloc([2]std.posix.fd_t, num_commands - 1);
     defer shell.allocator.free(pipes);
 
+    // initialize to invalid fd for safe cleanup on error
+    for (pipes) |*pipe_fds| {
+        pipe_fds.*[0] = -1;
+        pipe_fds.*[1] = -1;
+    }
+
+    // cleanup pipes on error (fork failure, etc)
+    errdefer {
+        for (pipes) |pipe_fds| {
+            if (pipe_fds[0] != -1) std.posix.close(pipe_fds[0]);
+            if (pipe_fds[1] != -1) std.posix.close(pipe_fds[1]);
+        }
+    }
+
     for (pipes) |*pipe_fds| {
         pipe_fds.* = try std.posix.pipe();
     }

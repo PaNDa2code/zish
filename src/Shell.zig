@@ -1460,18 +1460,43 @@ fn handleTabCompletion(self: *Shell) !void {
     const word_end = word_result.end;
 
     // determine base directory and search pattern
+    // expand ~ to home directory if needed
+    var expanded_dir_buf: [4096]u8 = undefined;
     const search_dir: []const u8 = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash| blk: {
         if (last_slash == 0) {
             // absolute path like "/etc"
             break :blk "/";
         } else {
-            // relative path with directory like "src/"
-            break :blk word[0..last_slash];
+            const dir_part = word[0..last_slash];
+            // expand ~ at start
+            if (std.mem.startsWith(u8, dir_part, "~")) {
+                const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk dir_part;
+                defer self.allocator.free(home);
+                const rest = dir_part[1..]; // skip ~
+                const expanded_len = home.len + rest.len;
+                if (expanded_len < expanded_dir_buf.len) {
+                    @memcpy(expanded_dir_buf[0..home.len], home);
+                    @memcpy(expanded_dir_buf[home.len..expanded_len], rest);
+                    break :blk expanded_dir_buf[0..expanded_len];
+                }
+            }
+            break :blk dir_part;
         }
+    } else if (std.mem.eql(u8, word, "~")) blk: {
+        // just "~" - expand to home
+        const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk ".";
+        defer self.allocator.free(home);
+        if (home.len < expanded_dir_buf.len) {
+            @memcpy(expanded_dir_buf[0..home.len], home);
+            break :blk expanded_dir_buf[0..home.len];
+        }
+        break :blk ".";
     } else "."; // no slash, search in current directory
 
     const pattern = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash|
         word[last_slash + 1 ..]
+    else if (std.mem.eql(u8, word, "~"))
+        "" // empty pattern to match all in home
     else
         word;
 
@@ -2211,7 +2236,7 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
 
                 if (paren_count == 0) {
                     const expr = input[expr_start..i-1];
-                    i += 2; // consume ))
+                    i += 1; // consume final ) (first one was consumed in loop)
 
                     // Evaluate arithmetic expression
                     const arith_result = try self.evaluateArithmetic(expr);
@@ -2607,6 +2632,16 @@ fn executeCommandLegacy(self: *Shell, command: []const u8) !u8 {
     const env_map = try std.process.getEnvMap(self.allocator);
     child.env_map = &env_map;
 
+    // ignore SIGINT in shell while child runs (child will receive it)
+    var old_sigint: std.posix.Sigaction = undefined;
+    const ignore_action = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
+
     _ = child.spawn() catch |err| {
         try self.stdout().print("zish: {s}: {}\n", .{ cmd_name, err });
         return 127;
@@ -2710,6 +2745,16 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
 
     // inherit full environment from parent
     child.env_map = null; // null means inherit all from parent
+
+    // ignore SIGINT in shell while child runs (child will receive it)
+    var old_sigint: std.posix.Sigaction = undefined;
+    const ignore_action = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
 
     const term = child.spawnAndWait() catch |err| switch (err) {
         error.FileNotFound => {

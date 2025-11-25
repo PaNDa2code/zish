@@ -1,29 +1,30 @@
-# TODOs
+advanced_spec.sh  basic_spec.sh  spec_helper.sh
+[I] alice@atomman ~/rotko/zish $ git status
+On branch main
+Your branch is up to date with 'rotko/main'.
 
-## known bugs in 4.2
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	deleted:    TODO.md
+	modified:   src/Shell.zig
+	modified:   src/crypto.zig
+	modified:   src/eval.zig
+	modified:   src/history.zig
+	modified:   src/history_log.zig
 
-### bugs in completion 
-does not handle more than 1 arg
-does not complete paths starting wtih ~/
-probably shit ton of other bugs in it
-```
-[I] alice@atomman ~ $ cd rotko/zi
-zish/
-zigner/
-[I] alice@atomman ~ $ cd rotko/zish/
-[I] alice@atomman ~/rotko/zish $ ls
-build.zig      README.md  spec
-build.zig.zon  rnd        src
-Makefile       scripts    zig-out
-[I] alice@atomman ~/rotko/zish $ cd ~/rotko/z
-```
+Changes not staged for commit:
+  (use "git add/rm <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	deleted:    rnd/comptime_opts.zig
+	deleted:    rnd/history_fast.zig
+	deleted:    rnd/history_simple.zig
+	deleted:    rnd/lexer_fast.zig
+	deleted:    rnd/lockfree.zig
+	deleted:    rnd/pipeline_fast.zig
+	deleted:    rnd/simd.zig
+	deleted:    rnd/strings.zig
+
+[I] alice@atomman ~/rotko/zish $ git add rnd
 
 
-### de/encryption bugs in history
-warning: failed to decrypt entry: error.AuthenticationFailed, skipping
-chpw only takes like 1 letter
-iss a mess atm
-
-
-### CRITICAL: 
-ctrl+c signal kills whole tty instead of just ongoing child task. 
+-> predictive git tab completion

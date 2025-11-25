@@ -20,7 +20,7 @@ pub const EntryHeader = extern struct {
     timestamp: u64,
     padding: [6]u8,
 
-    fn validate(self: EntryHeader) !void {
+    pub fn validate(self: EntryHeader) !void {
         if (!std.mem.eql(u8, &self.magic, MAGIC)) {
             return error.InvalidMagic;
         }

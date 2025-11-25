@@ -667,12 +667,17 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .vim_mode => |mode_action| {
             switch (mode_action) {
-                .set_mode => |mode| self.vim_mode = mode,
+                .set_mode => |mode| {
+                    self.vim_mode = mode;
+                    // entering normal mode should exit paste mode
+                    if (mode == .normal) self.paste_mode = false;
+                },
                 .toggle_enabled => {
                     self.vim_mode_enabled = !self.vim_mode_enabled;
                 },
                 .toggle_mode => {
                     self.vim_mode = if (self.vim_mode == .normal) .insert else .normal;
+                    if (self.vim_mode == .normal) self.paste_mode = false;
                 },
             }
             // update cursor style to match vim mode
@@ -1106,14 +1111,14 @@ fn readNextAction(self: *Shell) !Action {
         return escapeSequenceAction();
     }
 
-    // In paste mode, accept newlines and printable chars for multiline editing
-    // But always allow Ctrl+C to cancel
-    if (self.paste_mode) {
+    // In paste mode (and insert mode), buffer content for editing
+    // In normal mode, don't capture chars as input even if paste_mode is stuck
+    if (self.paste_mode and (!self.vim_mode_enabled or self.vim_mode == .insert)) {
         if (char == CTRL_C) {
             self.paste_mode = false;
             return .cancel;
         }
-        // Store newlines literally for multiline editing
+        // Store newlines for multiline editing
         if (char == '\n' or char == '\r') {
             return .{ .input_char = '\n' };
         }
@@ -1167,8 +1172,8 @@ fn normalModeAction(char: u8) Action {
         'e' => .{ .move_cursor = .{ .word_forward = .word_end } },
         'E' => .{ .move_cursor = .{ .word_forward = .WORD_end } },
 
-        'j' => .{ .history_nav = .down },
-        'k' => .{ .history_nav = .up },
+        'j' => .{ .move_cursor = .line_down },
+        'k' => .{ .move_cursor = .line_up },
 
         'i' => .{ .vim_mode = .{ .set_mode = .insert } },
 
@@ -2458,12 +2463,20 @@ fn loadAliases(self: *Shell) !void {
 }
 
 pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
-    // check if command starts with an alias
-    const resolved_command = self.resolveAlias(command);
-    defer if (!std.mem.eql(u8, resolved_command, command)) self.allocator.free(resolved_command);
+    // split on newlines and execute each line
+    var exit_code: u8 = 0;
+    var lines = std.mem.splitScalar(u8, command, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
 
-    const exit_code = try self.executeCommandInternal(resolved_command);
-    self.last_exit_code = exit_code;
+        // check if command starts with an alias
+        const resolved_command = self.resolveAlias(trimmed);
+        defer if (!std.mem.eql(u8, resolved_command, trimmed)) self.allocator.free(resolved_command);
+
+        exit_code = try self.executeCommandInternal(resolved_command);
+        self.last_exit_code = exit_code;
+    }
     return exit_code;
 }
 

@@ -30,7 +30,10 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
 pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
 
-    const cmd_name = node.children[0].value;
+    // expand command name (for ~/path/to/cmd)
+    const raw_cmd = node.children[0].value;
+    const cmd_name = try shell.expandVariables(raw_cmd);
+    defer shell.allocator.free(cmd_name);
 
     // expand glob patterns in arguments
     var expanded_args = try std.ArrayList([]const u8).initCapacity(shell.allocator, 16);

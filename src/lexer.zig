@@ -179,6 +179,19 @@ pub const Lexer = struct {
             return self.nextToken();
         }
 
+        // handle backslash-newline line continuation
+        if (char == '\\') {
+            _ = try self.advance(); // consume backslash
+            if (self.peek()) |next| {
+                if (next == '\n') {
+                    _ = try self.advance(); // skip newline
+                    return self.nextToken(); // continue on next line
+                }
+            }
+            // backslash not followed by newline - treat as word starting with backslash
+            return self.handleWord(start_line, start_column);
+        }
+
         const token = switch (char) {
             '$' => self.handleDollar(start_line, start_column),
             '\'' => self.handleSingleQuote(start_line, start_column),

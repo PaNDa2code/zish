@@ -3046,7 +3046,14 @@ fn executeCommandLegacy(self: *Shell, command: []const u8) !u8 {
     const env_map = try std.process.getEnvMap(self.allocator);
     child.env_map = &env_map;
 
-    // ignore SIGINT in shell while child runs (child will receive it)
+    // spawn child first, THEN ignore SIGINT in parent
+    // (child must not inherit SIG_IGN or it can't be interrupted)
+    _ = child.spawn() catch |err| {
+        try self.stdout().print("zish: {s}: {}\n", .{ cmd_name, err });
+        return 127;
+    };
+
+    // now ignore SIGINT in shell while child runs
     var old_sigint: std.posix.Sigaction = undefined;
     const ignore_action = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
@@ -3055,11 +3062,6 @@ fn executeCommandLegacy(self: *Shell, command: []const u8) !u8 {
     };
     std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
     defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
-
-    _ = child.spawn() catch |err| {
-        try self.stdout().print("zish: {s}: {}\n", .{ cmd_name, err });
-        return 127;
-    };
 
     const term = child.wait() catch |err| {
         try self.stdout().print("zish: wait failed: {}\n", .{err});
@@ -3160,7 +3162,17 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
     // inherit full environment from parent
     child.env_map = null; // null means inherit all from parent
 
-    // ignore SIGINT in shell while child runs (child will receive it)
+    // spawn child first, THEN ignore SIGINT in parent
+    // (child must not inherit SIG_IGN or it can't be interrupted)
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => {
+            try self.stdout().print("zish: {s}: command not found\n", .{args.items[0]});
+            return 127;
+        },
+        else => return err,
+    };
+
+    // now ignore SIGINT in shell while child runs
     var old_sigint: std.posix.Sigaction = undefined;
     const ignore_action = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
@@ -3170,13 +3182,7 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
     std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
     defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
 
-    const term = child.spawnAndWait() catch |err| switch (err) {
-        error.FileNotFound => {
-            try self.stdout().print("zish: {s}: command not found\n", .{args.items[0]});
-            return 127;
-        },
-        else => return err,
-    };
+    const term = child.wait();
     return switch (term) {
         .Exited => |code| code,
         .Signal => |sig| @as(u8, @intCast(sig + 128)),

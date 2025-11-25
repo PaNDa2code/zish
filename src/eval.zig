@@ -454,7 +454,14 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     child.stderr_behavior = .Inherit;
     child.stdin_behavior = .Inherit;
 
-    // ignore SIGINT in shell while child runs (child will receive it)
+    // spawn child first, THEN ignore SIGINT in parent
+    // (child must not inherit SIG_IGN or it can't be interrupted)
+    child.spawn() catch {
+        try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
+        return 127;
+    };
+
+    // now ignore SIGINT in shell while child runs
     var old_sigint: std.posix.Sigaction = undefined;
     const ignore_action = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
@@ -464,9 +471,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
     defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
 
-    const term = child.spawnAndWait() catch {
-        try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
-        return 127;
+    const term = child.wait() catch {
+        try shell.stdout().print("zish: wait failed\n", .{});
+        return 1;
     };
 
     return switch (term) {

@@ -12,6 +12,7 @@ const input_mod = @import("input.zig");
 const completion_mod = @import("completion.zig");
 const eval = @import("eval.zig");
 const git = @import("git.zig");
+const highlight = @import("highlight.zig");
 
 // Re-export from input module
 const VimMode = input_mod.VimMode;
@@ -87,6 +88,9 @@ show_git_info: bool = false,
 
 // track displayed command lines for proper clearing
 displayed_cmd_lines: usize = 1,
+// track terminal cursor row (within our displayed content)
+// this may differ from logical cursor during paste
+terminal_cursor_row: usize = 0,
 
 // terminal resize handling
 terminal_resized: bool = false,
@@ -97,11 +101,31 @@ last_resize_time: i64 = 0,
 stdout_writer: std.fs.File.Writer,
 log_file: ?std.fs.File = null,
 
+// syntax highlighting
+highlighter: highlight.Highlighter,
+highlight_buffer: std.ArrayList(u8),
+enable_highlighting: bool = true,
+
+// PATH lookup cache - maps command name -> full path
+path_cache: std.StringHashMap([]const u8),
+path_cache_version: u64 = 0, // incremented when PATH changes
+
 pub fn init(allocator: std.mem.Allocator) !*Shell {
+    return initWithOptions(allocator, true);
+}
+
+pub fn initNonInteractive(allocator: std.mem.Allocator) !*Shell {
+    return initWithOptions(allocator, false);
+}
+
+fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
     const shell = try allocator.create(Shell);
 
-    // try to initialize history, but don't fail if it doesn't work
-    const history = hist.History.init(allocator, null) catch null;
+    // only load history for interactive mode
+    const history = if (load_config)
+        hist.History.init(allocator, null) catch null
+    else
+        null;
 
     // allocate buffer for current command editing
     const cmd_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
@@ -140,13 +164,18 @@ pub fn init(allocator: std.mem.Allocator) !*Shell {
         .completion_menu_lines = 0,
         .completion_displayed = false,
         .stdout_writer = .init(.stdout(), writer_buffer),
+        .highlighter = try highlight.Highlighter.init(allocator),
+        .highlight_buffer = try std.ArrayList(u8).initCapacity(allocator, 4096),
+        .path_cache = std.StringHashMap([]const u8).init(allocator),
     };
 
     // don't enable raw mode here - will be enabled by run() for interactive mode
     // this prevents issues with child processes in non-interactive mode
 
-    // load aliases from ~/.zishrc
-    shell.loadAliases() catch {}; // don't fail if no config file
+    // load config only for interactive mode
+    if (load_config) {
+        shell.loadAliases() catch {}; // don't fail if no config file
+    }
 
     return shell;
 }
@@ -190,11 +219,104 @@ pub fn deinit(self: *Shell) void {
     }
     self.completion_matches.deinit(self.allocator);
 
+    // cleanup highlighter
+    self.highlighter.deinit();
+    self.highlight_buffer.deinit(self.allocator);
+
+    // cleanup path cache
+    var path_it = self.path_cache.iterator();
+    while (path_it.next()) |entry| {
+        self.allocator.free(entry.key_ptr.*);
+        self.allocator.free(entry.value_ptr.*);
+    }
+    self.path_cache.deinit();
+
     self.allocator.free(self.current_command);
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
     self.allocator.free(self.stdout().buffer);
     self.allocator.destroy(self);
+}
+
+/// Look up a command in PATH, using cache when possible
+pub fn lookupCommand(self: *Shell, cmd_name: []const u8) ?[]const u8 {
+    // don't cache absolute/relative paths
+    if (cmd_name.len > 0 and (cmd_name[0] == '/' or cmd_name[0] == '.')) {
+        return null;
+    }
+
+    // check cache first
+    if (self.path_cache.get(cmd_name)) |cached_path| {
+        // verify file still exists and is executable
+        const file = std.fs.openFileAbsolute(cached_path, .{}) catch {
+            // file no longer exists, remove from cache
+            if (self.path_cache.fetchRemove(cmd_name)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
+            return self.searchPath(cmd_name);
+        };
+        file.close();
+        return cached_path;
+    }
+
+    return self.searchPath(cmd_name);
+}
+
+fn searchPath(self: *Shell, cmd_name: []const u8) ?[]const u8 {
+    const path_env = std.posix.getenv("PATH") orelse return null;
+
+    var path_iter = std.mem.splitScalar(u8, path_env, ':');
+    while (path_iter.next()) |dir| {
+        if (dir.len == 0) continue;
+
+        // build full path: dir + "/" + cmd_name
+        const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, cmd_name }) catch continue;
+
+        // check if file exists and is executable
+        const file = std.fs.openFileAbsolute(full_path, .{}) catch {
+            self.allocator.free(full_path);
+            continue;
+        };
+        const stat = file.stat() catch {
+            file.close();
+            self.allocator.free(full_path);
+            continue;
+        };
+        file.close();
+        // check execute bit
+        if ((stat.mode & 0o111) == 0) {
+            self.allocator.free(full_path);
+            continue;
+        }
+
+        // found it - cache and return
+        const key_copy = self.allocator.dupe(u8, cmd_name) catch {
+            self.allocator.free(full_path);
+            return null;
+        };
+
+        self.path_cache.put(key_copy, full_path) catch {
+            self.allocator.free(key_copy);
+            self.allocator.free(full_path);
+            return null;
+        };
+
+        return full_path;
+    }
+
+    return null;
+}
+
+/// Clear PATH cache (call when PATH env var changes)
+pub fn invalidatePathCache(self: *Shell) void {
+    var it = self.path_cache.iterator();
+    while (it.next()) |entry| {
+        self.allocator.free(entry.key_ptr.*);
+        self.allocator.free(entry.value_ptr.*);
+    }
+    self.path_cache.clearRetainingCapacity();
+    self.path_cache_version +%= 1;
 }
 
 pub fn run(self: *Shell) !void {
@@ -473,6 +595,8 @@ fn handleAction(self: *Shell, action: Action) !void {
             self.cursor_pos = 0;
             self.history_index = -1;
             self.history_search_prefix_len = 0;
+            self.displayed_cmd_lines = 1; // fresh prompt
+            self.terminal_cursor_row = 0;
             self.vim_mode = .insert; // Always return to insert mode
             try self.setCursorStyle(.bar);
             try self.stdout().writeByte('\n');
@@ -543,21 +667,28 @@ fn handleAction(self: *Shell, action: Action) !void {
                 self.current_command_len += 1;
                 self.cursor_pos += 1;
 
-                // Update display
-                if (char == '\n') {
-                    // Newline requires full redraw for multiline support
-                    try self.redrawLine();
-                } else if (self.cursor_pos == self.current_command_len) {
-                    // At end of line - just echo the character
-                    try self.stdout().writeByte(char);
-                } else {
-                    // In middle of line - need to redraw from cursor onwards
-                    // Write the new character and everything after it
-                    try self.stdout().writeAll(self.current_command[self.cursor_pos - 1 .. self.current_command_len]);
-                    // Move cursor back to correct position
-                    const chars_to_move_back = self.current_command_len - self.cursor_pos;
-                    if (chars_to_move_back > 0) {
-                        try self.stdout().print("\x1b[{d}D", .{chars_to_move_back});
+                // Update display (skip during paste mode - redraw at paste end)
+                if (!self.paste_mode) {
+                    // Check if content has newlines or might wrap - use full redraw
+                    // This ensures terminal_cursor_row stays accurate
+                    const has_newlines = std.mem.indexOfScalar(u8, self.current_command[0..self.current_command_len], '\n') != null;
+                    const term_width = if (self.terminal_width > 0) self.terminal_width else 80;
+                    const prompt_len = self.calculatePromptLength();
+                    const might_wrap = (self.current_command_len + prompt_len) >= term_width;
+
+                    if (char == '\n' or has_newlines or might_wrap) {
+                        // Full redraw for multiline or wrapped content
+                        try self.redrawLine();
+                    } else if (self.cursor_pos == self.current_command_len) {
+                        // Simple case: single line, at end - just echo
+                        try self.stdout().writeByte(char);
+                    } else {
+                        // Mid-line insert on single short line
+                        try self.stdout().writeAll(self.current_command[self.cursor_pos - 1 .. self.current_command_len]);
+                        const chars_to_move_back = self.current_command_len - self.cursor_pos;
+                        if (chars_to_move_back > 0) {
+                            try self.stdout().print("\x1b[{d}D", .{chars_to_move_back});
+                        }
                     }
                 }
             }
@@ -647,6 +778,8 @@ fn handleAction(self: *Shell, action: Action) !void {
                 self.cursor_pos = 0;
                 self.history_index = -1;
                 self.history_search_prefix_len = 0;
+                self.displayed_cmd_lines = 1; // reset for new prompt
+                self.terminal_cursor_row = 0; // reset terminal cursor tracking
                 self.vim_mode = .insert;
                 try self.setCursorStyle(.bar);
 
@@ -659,10 +792,10 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .clear_screen => {
             try self.stdout().writeAll("\x1b[2J\x1b[H");
-            try self.printFancyPrompt();
-            if (self.current_command_len > 0) {
-                try self.stdout().writeAll(self.current_command[0..self.current_command_len]);
-            }
+            self.displayed_cmd_lines = 1;
+            self.terminal_cursor_row = 0;
+            // redrawLine handles prompt + content + cursor tracking
+            try self.redrawLine();
         },
 
         .vim_mode => |mode_action| {
@@ -2204,9 +2337,9 @@ fn redrawLine(self: *Shell) !void {
     const prompt_len = self.calculatePromptLength();
     const term_width = if (self.terminal_width > 0) self.terminal_width else 80;
     const cmd = self.current_command[0..self.current_command_len];
-
-    // Count total display lines (accounting for newlines, continuation markers, and wrapping)
     const continuation_marker_len: usize = 2; // "│ "
+
+    // Count total display lines for the new content
     var new_lines: usize = 1;
     var col: usize = prompt_len;
     for (cmd) |c| {
@@ -2222,17 +2355,21 @@ fn redrawLine(self: *Shell) !void {
         }
     }
 
-    // Use the larger of old and new line counts for clearing
-    const lines_to_clear = @max(self.displayed_cmd_lines, new_lines);
+    // Use terminal_cursor_row (where terminal cursor actually is)
+    // This tracks real terminal state, not buffer cursor position
+    const actual_cursor_row = self.terminal_cursor_row;
 
-    // Move to start of first line
-    if (lines_to_clear > 1) {
-        try self.stdout().print("\x1b[{d}F", .{lines_to_clear - 1});
-    } else {
-        try self.stdout().writeAll("\r");
+    // Only clear lines we actually own (displayed_cmd_lines), not new_lines
+    // New lines will be added by outputting content
+    const lines_to_clear = self.displayed_cmd_lines;
+
+    // Move cursor up to the first line of OUR content
+    if (actual_cursor_row > 0) {
+        try self.stdout().print("\x1b[{d}A", .{actual_cursor_row});
     }
+    try self.stdout().writeAll("\r");
 
-    // Clear all lines
+    // Clear only the lines we previously displayed
     for (0..lines_to_clear) |i| {
         try self.stdout().writeAll("\x1b[2K");
         if (i < lines_to_clear - 1) {
@@ -2240,7 +2377,7 @@ fn redrawLine(self: *Shell) !void {
         }
     }
 
-    // Move back to start
+    // Move back to the first line
     if (lines_to_clear > 1) {
         try self.stdout().print("\x1b[{d}A", .{lines_to_clear - 1});
     }
@@ -2252,13 +2389,44 @@ fn redrawLine(self: *Shell) !void {
     // Redraw prompt
     try self.printFancyPrompt();
 
-    // Write current command buffer with continuation markers
+    // Write current command buffer with continuation markers and syntax highlighting
     if (self.current_command_len > 0) {
-        for (cmd) |c| {
-            if (c == '\n') {
-                try self.stdout().writeAll("\n\x1b[90m│\x1b[0m ");
-            } else {
-                try self.stdout().writeByte(c);
+        if (self.enable_highlighting) {
+            // Apply syntax highlighting
+            self.highlight_buffer.clearRetainingCapacity();
+            self.highlighter.highlight(cmd, &self.highlight_buffer) catch {
+                // On highlight error, fall back to plain output
+                for (cmd) |c| {
+                    if (c == '\n') {
+                        try self.stdout().writeAll("\n\x1b[90m│\x1b[0m ");
+                    } else {
+                        try self.stdout().writeByte(c);
+                    }
+                }
+                return;
+            };
+            // Write highlighted output, handling newlines for continuation
+            var i: usize = 0;
+            const highlighted = self.highlight_buffer.items;
+            while (i < highlighted.len) {
+                if (highlighted[i] == '\n') {
+                    try self.stdout().writeAll("\x1b[0m\n\x1b[90m│\x1b[0m ");
+                    i += 1;
+                } else {
+                    try self.stdout().writeByte(highlighted[i]);
+                    i += 1;
+                }
+            }
+            // Reset colors at end
+            try self.stdout().writeAll("\x1b[0m");
+        } else {
+            // Plain output without highlighting
+            for (cmd) |c| {
+                if (c == '\n') {
+                    try self.stdout().writeAll("\n\x1b[90m│\x1b[0m ");
+                } else {
+                    try self.stdout().writeByte(c);
+                }
             }
         }
     }
@@ -2307,6 +2475,9 @@ fn redrawLine(self: *Shell) !void {
     } else {
         try self.stdout().print("\r\x1b[{d}C", .{cursor_col});
     }
+
+    // Update terminal cursor row tracking
+    self.terminal_cursor_row = cursor_line;
 
     try self.stdout().flush();
 }
@@ -2465,20 +2636,13 @@ fn loadAliases(self: *Shell) !void {
 }
 
 pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
-    // split on newlines and execute each line
-    var exit_code: u8 = 0;
-    var lines = std.mem.splitScalar(u8, command, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) continue;
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (trimmed.len == 0) return 0;
 
-        // check if command starts with an alias
-        const resolved_command = self.resolveAlias(trimmed);
-        defer if (!std.mem.eql(u8, resolved_command, trimmed)) self.allocator.free(resolved_command);
-
-        exit_code = try self.executeCommandInternal(resolved_command);
-        self.last_exit_code = exit_code;
-    }
+    // TODO: alias expansion should be done at parse time for full script
+    // for now just pass the full script to the parser
+    const exit_code = try self.executeCommandInternal(trimmed);
+    self.last_exit_code = exit_code;
     return exit_code;
 }
 
@@ -2600,6 +2764,32 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
             // Handle ${VAR} and ${VAR:-default} syntax
             if (i < input.len and input[i] == '{') {
                 i += 1; // skip {
+
+                // Check for ${#VAR} length expansion
+                if (i < input.len and input[i] == '#') {
+                    i += 1; // skip #
+                    const name_start = i;
+                    while (i < input.len and input[i] != '}') {
+                        i += 1;
+                    }
+                    const var_name = input[name_start..i];
+                    if (i < input.len and input[i] == '}') i += 1;
+
+                    // Get variable value and compute length
+                    var var_len: usize = 0;
+                    if (self.variables.get(var_name)) |value| {
+                        var_len = value.len;
+                    } else if (std.process.getEnvVarOwned(self.allocator, var_name)) |val| {
+                        var_len = val.len;
+                        self.allocator.free(val);
+                    } else |_| {}
+
+                    var len_buf: [20]u8 = undefined;
+                    const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{var_len}) catch "0";
+                    try result.appendSlice(self.allocator, len_str);
+                    continue;
+                }
+
                 const name_start = i;
 
                 // Find end of variable name or modifier
@@ -2788,24 +2978,17 @@ fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
 
 fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
     // Execute a command and capture its output
-    // For now, implement simple built-in commands
-
     const trimmed_cmd = std.mem.trim(u8, command, " \t\n\r");
 
+    // Only handle simple built-ins that don't need pipelines
     if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
         var buf: [4096]u8 = undefined;
         const cwd = std.posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
         return self.allocator.dupe(u8, cwd);
-    } else if (std.mem.eql(u8, trimmed_cmd, "date")) {
-        // Simple date implementation - just return a placeholder
-        return self.allocator.dupe(u8, "Wed Oct 16 10:00:00 UTC 2025");
-    } else if (std.mem.startsWith(u8, trimmed_cmd, "echo ")) {
-        const msg = trimmed_cmd[5..];
-        return self.allocator.dupe(u8, msg);
-    } else {
-        // For other commands, try to execute them externally and capture output
-        return self.executeExternalAndCapture(trimmed_cmd) catch self.allocator.dupe(u8, "");
     }
+
+    // For all other commands (including pipelines), execute via shell
+    return self.executeExternalAndCapture(trimmed_cmd) catch self.allocator.dupe(u8, "");
 }
 
 fn executeExternalAndCapture(self: *Shell, command: []const u8) ![]const u8 {

@@ -1,907 +1,749 @@
-// secure_lexer.zig - memory-safe, bounded lexer
+// lexer.zig - flat state machine lexer for zish
+// Design: one loop, one switch, explicit state transitions
 
 const std = @import("std");
 const types = @import("types.zig");
 
-// token types with security annotations
 pub const TokenType = enum {
-    // basic elements
     Word,
-    Integer,
-    String, // single-quoted (no expansion)
-    DoubleQuotedString, // double-quoted (with expansion)
+    String,              // quoted string content (for highlighting)
+    DoubleQuotedString,  // double-quoted content
 
-    // variables and expansions
+    // operators
+    Pipe,           // |
+    And,            // &&
+    Or,             // ||
+    Background,     // &
+    Semicolon,      // ;
+    NewLine,        // \n
+
+    // redirects
+    RedirectInput,       // <
+    RedirectOutput,      // >
+    RedirectAppend,      // >>
+    RedirectHereDoc,     // <<<
+    RedirectHereDocLiteral, // <<
+    RedirectStderr,      // 2>
+    RedirectBoth,        // 2>&1
+
+    // grouping
+    LeftParen,      // (
+    RightParen,     // )
+    LeftBrace,      // {
+    RightBrace,     // }
+    TestOpen,       // [[
+    TestClose,      // ]]
+
+    // keywords
+    If, Then, Else, Elif, Fi,
+    For, While, Until, Do, Done, In,
+    Case, Esac, Function,
+
+    // special
     Dollar,
     ParameterExpansion,
     CommandSubstitution,
     ArithmeticExpansion,
-
-    // redirection
-    RedirectInput, // <
-    RedirectOutput, // >
-    RedirectAppend, // >>
-    RedirectHereDoc, // <<<
-    RedirectHereDocLiteral, // <<
-    RedirectStderr, // 2>
-    RedirectBoth, // 2>&1
-
-    // pipes and background
-    Pipe,
-    Background,
-
-    // control structures
-    If, Then, Else, Elif, Fi,
-    For, While, Until, Do, Done, In,
-    Case, Esac,
-    Function,
-
-    // logical operators
-    And, // &&
-    Or, // ||
-    Not,
-
-    // grouping
-    LeftParen, RightParen,
-    LeftBrace, RightBrace,
-
-    // test expressions
-    TestOpen,  // [[
-    TestClose, // ]]
-
-    // special
-    Semicolon,
-    NewLine,
     Eof,
 };
 
-// immutable token with bounded lifetime
 pub const Token = struct {
     ty: TokenType,
-    value: []const u8,  // points into lexer buffer or interned string
-    line: types.LineNumber,
-    column: types.ColumnNumber,
+    value: []const u8,
+    line: u32,
+    column: u32,
 
-    pub const EMPTY = Token{
-        .ty = .Eof,
-        .value = "",
-        .line = 0,
-        .column = 0,
-    };
-
-    pub fn isKeyword(self: Token, keyword: []const u8) bool {
-        // constant-time comparison for security
-        return std.mem.eql(u8, self.value, keyword);
-    }
+    pub const EMPTY = Token{ .ty = .Eof, .value = "", .line = 0, .column = 0 };
 };
 
-// bounded lexer with stack-allocated buffers
+// All lexer states - explicit and visible
+const State = enum {
+    normal,
+    word,
+    // single quote
+    sq,
+    // double quote
+    dq,
+    dq_esc,
+    dq_dollar,
+    dq_dollar_brace,
+    dq_dollar_paren,
+    // unquoted dollar
+    dollar,
+    dollar_brace,
+    dollar_paren,
+    dollar_dparen,  // $((
+    // backtick
+    tick,
+    tick_esc,
+    // comment
+    comment,
+    // operators
+    pipe,
+    amp,
+    gt,
+    lt,
+    lt_lt,
+    // escape
+    esc,
+    // bracket
+    lbracket,
+    rbracket,
+    // fd redirect (e.g., 2>)
+    fd_num,
+};
+
 pub const Lexer = struct {
     input: []const u8,
-    position: usize,
-    line: types.LineNumber,
-    column: types.ColumnNumber,
-    recursion_depth: types.RecursionDepth,
+    pos: usize,
+    line: u32,
+    column: u32,
+    state: State,
 
-    // stack-allocated bounded buffers (2 buffers to support current + peek tokens)
-    token_buffers: [2][types.MAX_TOKEN_LENGTH]u8,
-    buffer_index: u1,
-    heredoc_buffer: [types.MAX_HEREDOC_SIZE]u8,
+    // token building
+    token_start: usize,
+    token_line: u32,
+    token_col: u32,
+
+    // buffer for compound words (quotes concatenation)
+    buf: [types.MAX_TOKEN_LENGTH]u8,
+    buf_len: usize,
+    use_buf: bool,  // true if we're building into buffer
+
+    // nesting counters
+    paren_depth: u32,
+    brace_depth: u32,
 
     const Self = @This();
 
     pub fn init(input: []const u8) !Self {
         try types.validateShellSafe(input);
-
         return Self{
             .input = input,
-            .position = 0,
+            .pos = 0,
             .line = 1,
             .column = 1,
-            .recursion_depth = 0,
-            .token_buffers = undefined,
-            .buffer_index = 0,
-            .heredoc_buffer = undefined,
+            .state = .normal,
+            .token_start = 0,
+            .token_line = 1,
+            .token_col = 1,
+            .buf = undefined,
+            .buf_len = 0,
+            .use_buf = false,
+            .paren_depth = 0,
+            .brace_depth = 0,
         };
     }
 
-    // bounds-checked character access
     fn peek(self: *Self) ?u8 {
-        if (self.position >= self.input.len) return null;
-        return self.input[self.position];
+        return if (self.pos < self.input.len) self.input[self.pos] else null;
     }
 
     fn peekN(self: *Self, n: usize) ?u8 {
-        if (self.position + n >= self.input.len) return null;
-        return self.input[self.position + n];
+        const idx = self.pos + n;
+        return if (idx < self.input.len) self.input[idx] else null;
     }
 
-    fn advance(self: *Self) !?u8 {
-        if (self.position >= self.input.len) return null;
-
-        const char = self.input[self.position];
-
-        // bounds-checked increment
-        self.position = try types.checkedAdd(usize, self.position, 1);
-
-        if (char == '\n') {
-            self.line = try types.checkedAdd(types.LineNumber, self.line, 1);
+    fn advance(self: *Self) ?u8 {
+        if (self.pos >= self.input.len) return null;
+        const c = self.input[self.pos];
+        self.pos += 1;
+        if (c == '\n') {
+            self.line += 1;
             self.column = 1;
         } else {
-            self.column = try types.checkedAdd(types.ColumnNumber, self.column, 1);
+            self.column += 1;
         }
-
-        return char;
+        return c;
     }
 
-    // get current token buffer (alternates to support current + peek tokens)
-    fn getCurrentBuffer(self: *Self) []u8 {
-        return &self.token_buffers[self.buffer_index];
+    fn bufAppend(self: *Self, c: u8) void {
+        if (self.buf_len < self.buf.len) {
+            self.buf[self.buf_len] = c;
+            self.buf_len += 1;
+        }
+    }
+
+    fn bufAppendSlice(self: *Self, s: []const u8) void {
+        for (s) |c| self.bufAppend(c);
+    }
+
+    fn startToken(self: *Self) void {
+        self.token_start = self.pos;
+        self.token_line = self.line;
+        self.token_col = self.column;
+        self.buf_len = 0;
+        self.use_buf = false;
+    }
+
+    fn makeToken(self: *Self, ty: TokenType) Token {
+        const value = if (self.use_buf)
+            self.buf[0..self.buf_len]
+        else
+            self.input[self.token_start..self.pos];
+
+        return Token{
+            .ty = if (ty == .Word) classifyWord(value) else ty,
+            .value = value,
+            .line = self.token_line,
+            .column = self.token_col,
+        };
+    }
+
+    fn makeTokenValue(self: *Self, ty: TokenType, value: []const u8) Token {
+        return Token{
+            .ty = ty,
+            .value = value,
+            .line = self.token_line,
+            .column = self.token_col,
+        };
     }
 
     pub fn nextToken(self: *Self) !Token {
-        // skip whitespace
-        while (self.peek()) |char| {
-            if (!std.ascii.isWhitespace(char)) break;
-            _ = try self.advance();
-        }
+        while (true) {
+            const c = self.peek();
 
-        const start_line = self.line;
-        const start_column = self.column;
-
-        const char = self.peek() orelse {
-            return Token{
-                .ty = .Eof,
-                .value = "",
-                .line = start_line,
-                .column = start_column,
-            };
-        };
-
-        // handle comments (including shebangs)
-        if (char == '#') {
-            // skip shebang on first line
-            if (start_line == 1 and start_column == 1) {
-                // skip entire first line (shebang)
-                while (self.peek()) |c| {
-                    if (c == '\n') break;
-                    _ = try self.advance();
-                }
-                // skip the newline too and get next token
-                if (self.peek()) |c| {
-                    if (c == '\n') {
-                        _ = try self.advance();
+            switch (self.state) {
+                .normal => {
+                    // skip whitespace (but not newlines)
+                    if (c) |ch| {
+                        if (ch == ' ' or ch == '\t') {
+                            _ = self.advance();
+                            continue;
+                        }
                     }
-                }
-                return self.nextToken();
-            }
-            // regular comment - skip to end of line
-            while (self.peek()) |c| {
-                if (c == '\n') break;
-                _ = try self.advance();
-            }
-            // return the next token (could be newline or next line)
-            return self.nextToken();
-        }
 
-        // handle backslash-newline line continuation
-        if (char == '\\') {
-            if (self.peekN(1)) |next| {
-                if (next == '\n') {
-                    _ = try self.advance(); // consume backslash
-                    _ = try self.advance(); // skip newline
-                    return self.nextToken(); // continue on next line
-                }
-            }
-            // backslash followed by other char - treat as word (handleWord handles escapes)
-            return self.handleWord(start_line, start_column);
-        }
-
-        const token = switch (char) {
-            '$' => self.handleDollar(start_line, start_column),
-            '\'' => self.handleSingleQuote(start_line, start_column),
-            '"' => self.handleDoubleQuote(start_line, start_column),
-            '>' => self.handleRedirectOutput(start_line, start_column),
-            '<' => self.handleRedirectInput(start_line, start_column),
-            '|' => self.handlePipe(start_line, start_column),
-            '&' => self.handleBackground(start_line, start_column),
-            ';' => self.handleSemicolon(start_line, start_column),
-            '(' => self.handleLeftParen(start_line, start_column),
-            ')' => self.handleRightParen(start_line, start_column),
-            '{' => self.handleLeftBrace(start_line, start_column),
-            '}' => self.handleRightBrace(start_line, start_column),
-            '[' => self.handleLeftBracket(start_line, start_column),
-            ']' => self.handleRightBracket(start_line, start_column),
-            '\n' => self.handleNewline(start_line, start_column),
-            else => if (std.ascii.isDigit(char))
-                self.handleNumber(start_line, start_column)
-            else
-                self.handleWord(start_line, start_column),
-        };
-
-        // toggle buffer for next token
-        self.buffer_index +%= 1;
-
-        return token;
-    }
-
-    // secure string handling with bounds checking
-    fn handleWord(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        const start_pos = self.position;
-
-        while (self.peek()) |char| {
-            // bounds check token length
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) {
-                return error.TokenTooLong;
-            }
-
-            // handle backslash escapes - \x escapes the next character
-            if (char == '\\') {
-                _ = try self.advance(); // consume backslash
-                if (self.peek()) |_| {
-                    _ = try self.advance(); // consume escaped char
-                }
-                continue;
-            }
-
-            // handle backticks - skip over `...`
-            if (char == '`') {
-                _ = try self.advance();
-                while (self.peek()) |c| {
-                    _ = try self.advance();
-                    if (c == '`') break;
-                }
-                continue;
-            }
-
-            // handle $ specially - skip over expansions
-            if (char == '$') {
-                _ = try self.advance();
-                const next = self.peek();
-                if (next) |n| {
-                    if (n == '(') {
-                        // skip over $(...)
-                        _ = try self.advance(); // skip (
-                        var paren_count: u32 = 1;
-                        while (self.peek()) |c| {
-                            _ = try self.advance();
-                            if (c == '(') paren_count += 1;
-                            if (c == ')') {
-                                paren_count -= 1;
-                                if (paren_count == 0) break;
-                            }
-                        }
-                        continue;
-                    } else if (n == '{') {
-                        // skip over ${...}
-                        _ = try self.advance(); // skip {
-                        var brace_count: u32 = 1;
-                        while (self.peek()) |c| {
-                            _ = try self.advance();
-                            if (c == '{') brace_count += 1;
-                            if (c == '}') {
-                                brace_count -= 1;
-                                if (brace_count == 0) break;
-                            }
-                        }
-                        continue;
-                    } else if (std.ascii.isAlphabetic(n) or n == '_' or n == '?') {
-                        // skip over $VAR or $?
-                        if (n == '?') {
-                            _ = try self.advance();
-                        } else {
-                            while (self.peek()) |c| {
-                                if (!std.ascii.isAlphanumeric(c) and c != '_') break;
-                                _ = try self.advance();
-                            }
-                        }
-                        continue;
+                    if (c == null) {
+                        return Token.EMPTY;
                     }
-                }
-                // if none of the above, just $ alone, continue
-                continue;
-            }
 
-            if (isShellMetacharacter(char)) break;
-            _ = try self.advance();
-        }
+                    self.startToken();
+                    const ch = c.?;
 
-        if (self.position == start_pos) return error.EmptyToken;
+                    switch (ch) {
+                        '#' => {
+                            self.state = .comment;
+                            _ = self.advance();
+                        },
+                        '\'' => {
+                            _ = self.advance(); // skip opening quote
+                            self.token_start = self.pos; // start AFTER quote
+                            self.buf_len = 0;
+                            self.use_buf = true;
+                            self.state = .sq;
+                        },
+                        '"' => {
+                            _ = self.advance(); // skip opening quote
+                            self.token_start = self.pos; // start AFTER quote
+                            self.buf_len = 0;
+                            self.use_buf = true;
+                            self.state = .dq;
+                        },
+                        '`' => {
+                            self.state = .tick;
+                            _ = self.advance();
+                        },
+                        '$' => {
+                            self.state = .dollar;
+                            _ = self.advance();
+                        },
+                        '\\' => {
+                            self.state = .esc;
+                            _ = self.advance();
+                        },
+                        '|' => {
+                            _ = self.advance();
+                            if (self.peek() == @as(u8, '|')) {
+                                _ = self.advance();
+                                return self.makeTokenValue(.Or, "||");
+                            }
+                            return self.makeTokenValue(.Pipe, "|");
+                        },
+                        '&' => {
+                            _ = self.advance();
+                            if (self.peek() == @as(u8, '&')) {
+                                _ = self.advance();
+                                return self.makeTokenValue(.And, "&&");
+                            }
+                            return self.makeTokenValue(.Background, "&");
+                        },
+                        ';' => {
+                            _ = self.advance();
+                            return self.makeTokenValue(.Semicolon, ";");
+                        },
+                        '\n' => {
+                            _ = self.advance();
+                            return self.makeTokenValue(.NewLine, "\n");
+                        },
+                        '(' => {
+                            _ = self.advance();
+                            return self.makeTokenValue(.LeftParen, "(");
+                        },
+                        ')' => {
+                            _ = self.advance();
+                            return self.makeTokenValue(.RightParen, ")");
+                        },
+                        '{' => {
+                            _ = self.advance();
+                            return self.makeTokenValue(.LeftBrace, "{");
+                        },
+                        '}' => {
+                            _ = self.advance();
+                            return self.makeTokenValue(.RightBrace, "}");
+                        },
+                        '[' => {
+                            _ = self.advance();
+                            if (self.peek() == @as(u8, '[')) {
+                                _ = self.advance();
+                                return self.makeTokenValue(.TestOpen, "[[");
+                            }
+                            return self.makeTokenValue(.Word, "[");
+                        },
+                        ']' => {
+                            _ = self.advance();
+                            if (self.peek() == @as(u8, ']')) {
+                                _ = self.advance();
+                                return self.makeTokenValue(.TestClose, "]]");
+                            }
+                            return self.makeTokenValue(.Word, "]");
+                        },
+                        '>' => {
+                            _ = self.advance();
+                            if (self.peek() == @as(u8, '>')) {
+                                _ = self.advance();
+                                return self.makeTokenValue(.RedirectAppend, ">>");
+                            }
+                            return self.makeTokenValue(.RedirectOutput, ">");
+                        },
+                        '<' => {
+                            _ = self.advance();
+                            if (self.peek() == @as(u8, '<')) {
+                                _ = self.advance();
+                                if (self.peek() == @as(u8, '<')) {
+                                    _ = self.advance();
+                                    return self.makeTokenValue(.RedirectHereDoc, "<<<");
+                                }
+                                return self.makeTokenValue(.RedirectHereDocLiteral, "<<");
+                            }
+                            return self.makeTokenValue(.RedirectInput, "<");
+                        },
+                        '0'...'9' => {
+                            // check for fd redirect like 2>
+                            if (self.peekN(1) == @as(u8, '>')) {
+                                const fd = ch;
+                                _ = self.advance(); // digit
+                                _ = self.advance(); // >
+                                if (fd == '2' and self.peek() == @as(u8, '&')) {
+                                    if (self.peekN(1) == @as(u8, '1')) {
+                                        _ = self.advance();
+                                        _ = self.advance();
+                                        return self.makeTokenValue(.RedirectBoth, "2>&1");
+                                    }
+                                }
+                                return self.makeTokenValue(.RedirectStderr, &[_]u8{fd});
+                            }
+                            self.state = .word;
+                            _ = self.advance();
+                        },
+                        else => {
+                            self.state = .word;
+                            _ = self.advance();
+                        },
+                    }
+                },
 
-        // return slice directly from input (not from reused buffer)
-        const word = self.input[start_pos..self.position];
-        const token_type = if (isKeyword(word)) keywordToTokenType(word) else .Word;
+                .word => {
+                    if (c == null or isOperator(c.?)) {
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
 
-        return Token{
-            .ty = token_type,
-            .value = word,
-            .line = start_line,
-            .column = start_column,
-        };
-    }
+                    const ch = c.?;
+                    switch (ch) {
+                        // quotes continue the word
+                        '\'' => {
+                            self.switchToBuf();
+                            self.state = .sq;
+                            _ = self.advance();
+                        },
+                        '"' => {
+                            self.switchToBuf();
+                            self.state = .dq;
+                            _ = self.advance();
+                        },
+                        '$' => {
+                            self.switchToBuf();
+                            self.bufAppend('$');
+                            self.state = .dollar;
+                            _ = self.advance();
+                        },
+                        '`' => {
+                            self.switchToBuf();
+                            self.bufAppend('`');
+                            self.state = .tick;
+                            _ = self.advance();
+                        },
+                        '\\' => {
+                            self.switchToBuf();
+                            self.state = .esc;
+                            _ = self.advance();
+                        },
+                        else => {
+                            if (self.use_buf) self.bufAppend(ch);
+                            _ = self.advance();
+                        },
+                    }
+                },
 
-    // secure quoted string handling
-    fn handleDoubleQuote(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // skip opening quote
-        var len: usize = 0;
-        const buffer = self.getCurrentBuffer();
+                .sq => {
+                    // single quote: literal until closing '
+                    if (c == null) return error.UnterminatedString;
+                    const ch = c.?;
+                    if (ch == '\'') {
+                        _ = self.advance();
+                        // check if word continues
+                        if (self.peek()) |next| {
+                            if (!isOperator(next)) {
+                                self.state = .word;
+                                continue;
+                            }
+                        }
+                        self.state = .normal;
+                        return self.makeToken(.String);
+                    }
+                    if (self.use_buf) self.bufAppend(ch);
+                    _ = self.advance();
+                },
 
-        while (self.peek()) |char| {
-            if (char == '"') {
-                _ = try self.advance();
-                return Token{
-                    .ty = .DoubleQuotedString,
-                    .value = buffer[0..len],
-                    .line = start_line,
-                    .column = start_column,
-                };
-            }
+                .dq => {
+                    // double quote: process escapes and $
+                    if (c == null) return error.UnterminatedString;
+                    const ch = c.?;
+                    switch (ch) {
+                        '"' => {
+                            _ = self.advance();
+                            // check if word continues
+                            if (self.peek()) |next| {
+                                if (!isOperator(next)) {
+                                    self.state = .word;
+                                    continue;
+                                }
+                            }
+                            self.state = .normal;
+                            return self.makeToken(.DoubleQuotedString);
+                        },
+                        '\\' => {
+                            self.state = .dq_esc;
+                            _ = self.advance();
+                        },
+                        '$' => {
+                            self.state = .dq_dollar;
+                            self.bufAppend('$');
+                            _ = self.advance();
+                        },
+                        else => {
+                            if (self.use_buf) self.bufAppend(ch);
+                            _ = self.advance();
+                        },
+                    }
+                },
 
-            // bounds check
-            if (len >= buffer.len - 1) {
-                return error.StringTooLong;
-            }
-
-            if (char == '\\') {
-                _ = try self.advance();
-                if (self.peek()) |escaped| {
-                    buffer[len] = switch (escaped) {
+                .dq_esc => {
+                    if (c == null) return error.UnterminatedString;
+                    const ch = c.?;
+                    // in double quotes: \$, \`, \", \\, \newline are special
+                    const escaped = switch (ch) {
+                        '$', '`', '"', '\\' => ch,
                         'n' => '\n',
                         't' => '\t',
-                        '\\' => '\\',
-                        '"' => '"',
-                        else => escaped,
+                        'r' => '\r',
+                        else => ch,
                     };
-                    len += 1;
-                    _ = try self.advance();
-                }
-            } else {
-                buffer[len] = char;
-                len += 1;
-                _ = try self.advance();
-            }
-        }
+                    if (self.use_buf) self.bufAppend(escaped);
+                    self.state = .dq;
+                    _ = self.advance();
+                },
 
-        return error.UnterminatedString;
-    }
-
-    fn handleSingleQuote(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // skip opening quote
-        const start_pos = self.position;
-
-        // single-quoted strings have no escapes, so we can use input slice directly
-        while (self.peek()) |char| {
-            if (char == '\'') {
-                const end_pos = self.position;
-                _ = try self.advance(); // skip closing quote
-                return Token{
-                    .ty = .String,
-                    .value = self.input[start_pos..end_pos],
-                    .line = start_line,
-                    .column = start_column,
-                };
-            }
-            _ = try self.advance();
-        }
-
-        return error.UnterminatedString;
-    }
-
-    // recursion-bounded expansion handling
-    fn handleDollar(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        if (self.recursion_depth >= types.MAX_RECURSION_DEPTH) {
-            return error.RecursionLimitExceeded;
-        }
-
-        const start_pos = self.position;
-        _ = try self.advance(); // skip $
-
-        const next = self.peek() orelse {
-            return self.makeToken(.Dollar, "$", start_line, start_column);
-        };
-
-        if (next == '{') {
-            return self.handleParameterExpansionWord(start_line, start_column);
-        }
-
-        if (next == '(') {
-            return self.handleCommandSubstitutionWord(start_line, start_column);
-        }
-
-        // handle $? special variable - continue reading rest of word
-        if (next == '?') {
-            _ = try self.advance();
-            // continue reading non-metacharacters to form complete word
-            while (self.peek()) |char| {
-                if (isShellMetacharacter(char)) break;
-                if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) return error.TokenTooLong;
-                _ = try self.advance();
-            }
-            return self.makeToken(.Word, self.input[start_pos..self.position], start_line, start_column);
-        }
-
-        // handle $VAR style variable references
-        if (!std.ascii.isAlphabetic(next) and next != '_') {
-            // just a lone $, but might be part of a larger word like "$*"
-            // continue reading to form complete word
-            while (self.peek()) |char| {
-                if (isShellMetacharacter(char)) break;
-                if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) return error.TokenTooLong;
-                _ = try self.advance();
-            }
-            const word = self.input[start_pos..self.position];
-            return self.makeToken(if (word.len == 1) .Dollar else .Word, word, start_line, start_column);
-        }
-
-        // read variable name
-        while (self.peek()) |char| {
-            if (!std.ascii.isAlphanumeric(char) and char != '_') break;
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) return error.TokenTooLong;
-            _ = try self.advance();
-        }
-
-        // continue reading non-metacharacters to form complete word (e.g., $USER.txt)
-        while (self.peek()) |char| {
-            if (isShellMetacharacter(char)) break;
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) return error.TokenTooLong;
-            _ = try self.advance();
-        }
-
-        return self.makeToken(.Word, self.input[start_pos..self.position], start_line, start_column);
-    }
-
-    fn handleParameterExpansionWord(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        self.recursion_depth = try types.checkedAdd(types.RecursionDepth, self.recursion_depth, 1);
-        defer self.recursion_depth -= 1;
-
-        const start_pos = self.position - 1; // include the $
-        _ = try self.advance(); // skip {
-        var brace_count: u32 = 1;
-
-        // find matching }
-        while (self.peek()) |char| {
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) {
-                return error.ExpansionTooLong;
-            }
-
-            if (char == '{') {
-                brace_count = try types.checkedAdd(u32, brace_count, 1);
-            } else if (char == '}') {
-                brace_count -= 1;
-                if (brace_count == 0) {
-                    _ = try self.advance(); // consume }
-                    break;
-                }
-            }
-            _ = try self.advance();
-        } else {
-            return error.UnterminatedParameterExpansion;
-        }
-
-        // continue reading non-metacharacters to form complete word
-        while (self.peek()) |char| {
-            if (isShellMetacharacter(char)) break;
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) return error.TokenTooLong;
-            _ = try self.advance();
-        }
-
-        return self.makeToken(.Word, self.input[start_pos..self.position], start_line, start_column);
-    }
-
-    fn handleParameterExpansion(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        self.recursion_depth = try types.checkedAdd(types.RecursionDepth, self.recursion_depth, 1);
-        defer self.recursion_depth -= 1;
-
-        _ = try self.advance(); // skip {
-        var len: usize = 0;
-        var brace_count: u32 = 1;
-        const buffer = self.getCurrentBuffer();
-
-        // store opening syntax
-        buffer[0] = '$';
-        buffer[1] = '{';
-        len = 2;
-
-        while (self.peek()) |char| {
-            if (len >= buffer.len - 1) {
-                return error.ExpansionTooLong;
-            }
-
-            buffer[len] = char;
-            len += 1;
-
-            if (char == '{') {
-                brace_count = try types.checkedAdd(u32, brace_count, 1);
-            } else if (char == '}') {
-                brace_count -= 1;
-                if (brace_count == 0) {
-                    _ = try self.advance();
-                    return Token{
-                        .ty = .ParameterExpansion,
-                        .value = buffer[0..len],
-                        .line = start_line,
-                        .column = start_column,
-                    };
-                }
-            }
-            _ = try self.advance();
-        }
-
-        return error.UnterminatedParameterExpansion;
-    }
-
-    fn handleCommandSubstitutionWord(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        self.recursion_depth = try types.checkedAdd(types.RecursionDepth, self.recursion_depth, 1);
-        defer self.recursion_depth -= 1;
-
-        const start_pos = self.position - 1; // include the $
-        _ = try self.advance(); // skip (
-        var paren_count: u32 = 1;
-
-        // find matching )
-        while (self.peek()) |char| {
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) {
-                return error.SubstitutionTooLong;
-            }
-
-            if (char == '(') {
-                paren_count = try types.checkedAdd(u32, paren_count, 1);
-            } else if (char == ')') {
-                paren_count -= 1;
-                if (paren_count == 0) {
-                    _ = try self.advance(); // consume )
-                    break;
-                }
-            }
-            _ = try self.advance();
-        } else {
-            return error.UnterminatedCommandSubstitution;
-        }
-
-        // continue reading non-metacharacters to form complete word
-        while (self.peek()) |char| {
-            if (isShellMetacharacter(char)) break;
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) return error.TokenTooLong;
-            _ = try self.advance();
-        }
-
-        return self.makeToken(.Word, self.input[start_pos..self.position], start_line, start_column);
-    }
-
-    fn handleCommandSubstitution(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        self.recursion_depth = try types.checkedAdd(types.RecursionDepth, self.recursion_depth, 1);
-        defer self.recursion_depth -= 1;
-
-        _ = try self.advance(); // skip (
-        var len: usize = 0;
-        var paren_count: u32 = 1;
-        const buffer = self.getCurrentBuffer();
-
-        // store opening syntax
-        buffer[0] = '$';
-        buffer[1] = '(';
-        len = 2;
-
-        while (self.peek()) |char| {
-            if (len >= buffer.len - 1) {
-                return error.SubstitutionTooLong;
-            }
-
-            buffer[len] = char;
-            len += 1;
-
-            if (char == '(') {
-                paren_count = try types.checkedAdd(u32, paren_count, 1);
-            } else if (char == ')') {
-                paren_count -= 1;
-                if (paren_count == 0) {
-                    _ = try self.advance();
-                    return Token{
-                        .ty = .CommandSubstitution,
-                        .value = buffer[0..len],
-                        .line = start_line,
-                        .column = start_column,
-                    };
-                }
-            }
-            _ = try self.advance();
-        }
-
-        return error.UnterminatedCommandSubstitution;
-    }
-
-    // simple token handlers
-    fn handlePipe(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // consume first |
-
-        // check for || (logical OR)
-        if (self.peek()) |next| {
-            if (next == '|') {
-                _ = try self.advance(); // consume second |
-                return Token{
-                    .ty = .Or,
-                    .value = "||",
-                    .line = start_line,
-                    .column = start_column,
-                };
-            }
-        }
-
-        // just a single | (pipe)
-        return Token{
-            .ty = .Pipe,
-            .value = "|",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleBackground(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // consume first &
-
-        // check for && (logical AND)
-        if (self.peek()) |next| {
-            if (next == '&') {
-                _ = try self.advance(); // consume second &
-                return Token{
-                    .ty = .And,
-                    .value = "&&",
-                    .line = start_line,
-                    .column = start_column,
-                };
-            }
-        }
-
-        // just a single & (background)
-        return Token{
-            .ty = .Background,
-            .value = "&",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleSemicolon(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance();
-        return Token{
-            .ty = .Semicolon,
-            .value = ";",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleLeftParen(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance();
-        return Token{
-            .ty = .LeftParen,
-            .value = "(",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleRightParen(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance();
-        return Token{
-            .ty = .RightParen,
-            .value = ")",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleLeftBrace(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance();
-        return Token{
-            .ty = .LeftBrace,
-            .value = "{",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleRightBrace(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance();
-        return Token{
-            .ty = .RightBrace,
-            .value = "}",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleLeftBracket(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // consume first [
-
-        // check for [[ (test open)
-        if (self.peek()) |next| {
-            if (next == '[') {
-                _ = try self.advance(); // consume second [
-                return Token{
-                    .ty = .TestOpen,
-                    .value = "[[",
-                    .line = start_line,
-                    .column = start_column,
-                };
-            }
-        }
-
-        // single [ - treat as word for now (used in glob patterns)
-        return Token{
-            .ty = .Word,
-            .value = "[",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleRightBracket(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // consume first ]
-
-        // check for ]] (test close)
-        if (self.peek()) |next| {
-            if (next == ']') {
-                _ = try self.advance(); // consume second ]
-                return Token{
-                    .ty = .TestClose,
-                    .value = "]]",
-                    .line = start_line,
-                    .column = start_column,
-                };
-            }
-        }
-
-        // single ] - treat as word for now (used in glob patterns)
-        return Token{
-            .ty = .Word,
-            .value = "]",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleRedirectOutput(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // consume first >
-
-        // check for >> (append)
-        if (self.peek()) |next| {
-            if (next == '>') {
-                _ = try self.advance(); // consume second >
-                return Token{
-                    .ty = .RedirectAppend,
-                    .value = ">>",
-                    .line = start_line,
-                    .column = start_column,
-                };
-            }
-        }
-
-        // just a single > (redirect output)
-        return Token{
-            .ty = .RedirectOutput,
-            .value = ">",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleRedirectInput(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance(); // consume first <
-
-        // check for <<< (here-doc) or << (here-string)
-        if (self.peek()) |next| {
-            if (next == '<') {
-                _ = try self.advance(); // consume second <
-                if (self.peek()) |third| {
-                    if (third == '<') {
-                        _ = try self.advance(); // consume third <
-                        return Token{
-                            .ty = .RedirectHereDoc,
-                            .value = "<<<",
-                            .line = start_line,
-                            .column = start_column,
-                        };
+                .dq_dollar => {
+                    // inside double quote, saw $
+                    if (c == null) {
+                        self.state = .dq;
+                        continue;
                     }
-                }
-                // just << (heredoc)
-                return Token{
-                    .ty = .RedirectHereDocLiteral,
-                    .value = "<<",
-                    .line = start_line,
-                    .column = start_column,
-                };
+                    const ch = c.?;
+                    switch (ch) {
+                        '{' => {
+                            self.bufAppend('{');
+                            self.brace_depth = 1;
+                            self.state = .dq_dollar_brace;
+                            _ = self.advance();
+                        },
+                        '(' => {
+                            self.bufAppend('(');
+                            self.paren_depth = 1;
+                            self.state = .dq_dollar_paren;
+                            _ = self.advance();
+                        },
+                        'a'...'z', 'A'...'Z', '_', '?', '!', '#', '*', '@', '-', '0'...'9' => {
+                            self.bufAppend(ch);
+                            _ = self.advance();
+                            // continue reading var name
+                            while (self.peek()) |nc| {
+                                if (std.ascii.isAlphanumeric(nc) or nc == '_') {
+                                    self.bufAppend(nc);
+                                    _ = self.advance();
+                                } else break;
+                            }
+                            self.state = .dq;
+                        },
+                        else => self.state = .dq,
+                    }
+                },
+
+                .dq_dollar_brace => {
+                    if (c == null) return error.UnterminatedExpansion;
+                    const ch = c.?;
+                    self.bufAppend(ch);
+                    if (ch == '{') self.brace_depth += 1;
+                    if (ch == '}') {
+                        self.brace_depth -= 1;
+                        if (self.brace_depth == 0) self.state = .dq;
+                    }
+                    _ = self.advance();
+                },
+
+                .dq_dollar_paren => {
+                    if (c == null) return error.UnterminatedExpansion;
+                    const ch = c.?;
+                    self.bufAppend(ch);
+                    if (ch == '(') self.paren_depth += 1;
+                    if (ch == ')') {
+                        self.paren_depth -= 1;
+                        if (self.paren_depth == 0) self.state = .dq;
+                    }
+                    _ = self.advance();
+                },
+
+                .dollar => {
+                    // unquoted $
+                    if (c == null) {
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
+                    const ch = c.?;
+                    switch (ch) {
+                        '{' => {
+                            self.bufAppend('{');
+                            self.brace_depth = 1;
+                            self.state = .dollar_brace;
+                            _ = self.advance();
+                        },
+                        '(' => {
+                            self.bufAppend('(');
+                            if (self.peekN(1) == @as(u8, '(')) {
+                                _ = self.advance();
+                                self.bufAppend('(');
+                                self.paren_depth = 2;
+                                self.state = .dollar_dparen;
+                            } else {
+                                self.paren_depth = 1;
+                                self.state = .dollar_paren;
+                            }
+                            _ = self.advance();
+                        },
+                        'a'...'z', 'A'...'Z', '_' => {
+                            self.bufAppend(ch);
+                            _ = self.advance();
+                            while (self.peek()) |nc| {
+                                if (std.ascii.isAlphanumeric(nc) or nc == '_') {
+                                    self.bufAppend(nc);
+                                    _ = self.advance();
+                                } else break;
+                            }
+                            // check if word continues
+                            if (self.peek()) |next| {
+                                if (!isOperator(next)) {
+                                    self.state = .word;
+                                    continue;
+                                }
+                            }
+                            self.state = .normal;
+                            return self.makeToken(.Word);
+                        },
+                        '?', '!', '#', '$', '*', '@', '-', '0'...'9' => {
+                            self.bufAppend(ch);
+                            _ = self.advance();
+                            if (self.peek()) |next| {
+                                if (!isOperator(next)) {
+                                    self.state = .word;
+                                    continue;
+                                }
+                            }
+                            self.state = .normal;
+                            return self.makeToken(.Word);
+                        },
+                        else => {
+                            // lone $
+                            if (!isOperator(ch)) {
+                                self.state = .word;
+                            } else {
+                                self.state = .normal;
+                                return self.makeToken(.Word);
+                            }
+                        },
+                    }
+                },
+
+                .dollar_brace => {
+                    if (c == null) return error.UnterminatedExpansion;
+                    const ch = c.?;
+                    self.bufAppend(ch);
+                    if (ch == '{') self.brace_depth += 1;
+                    if (ch == '}') {
+                        self.brace_depth -= 1;
+                        if (self.brace_depth == 0) {
+                            _ = self.advance();
+                            if (self.peek()) |next| {
+                                if (!isOperator(next)) {
+                                    self.state = .word;
+                                    continue;
+                                }
+                            }
+                            self.state = .normal;
+                            return self.makeToken(.Word);
+                        }
+                    }
+                    _ = self.advance();
+                },
+
+                .dollar_paren => {
+                    if (c == null) return error.UnterminatedExpansion;
+                    const ch = c.?;
+                    self.bufAppend(ch);
+                    if (ch == '(') self.paren_depth += 1;
+                    if (ch == ')') {
+                        self.paren_depth -= 1;
+                        if (self.paren_depth == 0) {
+                            _ = self.advance();
+                            if (self.peek()) |next| {
+                                if (!isOperator(next)) {
+                                    self.state = .word;
+                                    continue;
+                                }
+                            }
+                            self.state = .normal;
+                            return self.makeToken(.Word);
+                        }
+                    }
+                    _ = self.advance();
+                },
+
+                .dollar_dparen => {
+                    // $(( arithmetic ))
+                    if (c == null) return error.UnterminatedExpansion;
+                    const ch = c.?;
+                    self.bufAppend(ch);
+                    if (ch == '(') self.paren_depth += 1;
+                    if (ch == ')') {
+                        self.paren_depth -= 1;
+                        if (self.paren_depth == 0) {
+                            _ = self.advance();
+                            if (self.peek()) |next| {
+                                if (!isOperator(next)) {
+                                    self.state = .word;
+                                    continue;
+                                }
+                            }
+                            self.state = .normal;
+                            return self.makeToken(.Word);
+                        }
+                    }
+                    _ = self.advance();
+                },
+
+                .tick => {
+                    if (c == null) return error.UnterminatedString;
+                    const ch = c.?;
+                    if (self.use_buf) self.bufAppend(ch);
+                    if (ch == '`') {
+                        _ = self.advance();
+                        if (self.peek()) |next| {
+                            if (!isOperator(next)) {
+                                self.state = .word;
+                                continue;
+                            }
+                        }
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
+                    if (ch == '\\') {
+                        self.state = .tick_esc;
+                    }
+                    _ = self.advance();
+                },
+
+                .tick_esc => {
+                    if (c == null) return error.UnterminatedString;
+                    if (self.use_buf) self.bufAppend(c.?);
+                    self.state = .tick;
+                    _ = self.advance();
+                },
+
+                .esc => {
+                    // backslash escape
+                    if (c == null) {
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
+                    const ch = c.?;
+                    if (ch == '\n') {
+                        // line continuation - skip and continue
+                        _ = self.advance();
+                        self.state = if (self.use_buf or self.pos > self.token_start + 1) .word else .normal;
+                    } else {
+                        if (self.use_buf) self.bufAppend(ch);
+                        self.state = .word;
+                        _ = self.advance();
+                    }
+                },
+
+                .comment => {
+                    if (c == null or c.? == '\n') {
+                        self.state = .normal;
+                        // don't emit comment as token, just skip
+                        continue;
+                    }
+                    _ = self.advance();
+                },
+
+                else => {
+                    _ = self.advance();
+                    self.state = .normal;
+                },
             }
         }
-
-        // just a single < (redirect input)
-        return Token{
-            .ty = .RedirectInput,
-            .value = "<",
-            .line = start_line,
-            .column = start_column,
-        };
     }
 
-    fn handleNewline(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        _ = try self.advance();
-        return Token{
-            .ty = .NewLine,
-            .value = "\n",
-            .line = start_line,
-            .column = start_column,
-        };
-    }
-
-    fn handleNumber(self: *Self, start_line: types.LineNumber, start_column: types.ColumnNumber) !Token {
-        // peek ahead to check if this is an fd redirect (e.g., 2>)
-        var temp_pos = self.position;
-        while (temp_pos < self.input.len and std.ascii.isDigit(self.input[temp_pos])) {
-            temp_pos += 1;
+    fn switchToBuf(self: *Self) void {
+        if (!self.use_buf) {
+            // copy current token content to buffer
+            const current = self.input[self.token_start..self.pos];
+            @memcpy(self.buf[0..current.len], current);
+            self.buf_len = current.len;
+            self.use_buf = true;
         }
-
-        // not an fd redirect - delegate to handleWord for ip addresses, decimals, etc
-        if (temp_pos >= self.input.len or self.input[temp_pos] != '>') {
-            return self.handleWord(start_line, start_column);
-        }
-
-        // parse fd redirect number
-        const start_pos = self.position;
-        while (self.peek()) |char| {
-            if (!std.ascii.isDigit(char)) break;
-            if (self.position - start_pos >= types.MAX_TOKEN_LENGTH - 1) return error.NumberTooLong;
-            _ = try self.advance();
-        }
-
-        const fd_str = self.input[start_pos..self.position];
-        _ = try self.advance(); // consume >
-
-        // attempt to parse 2>&1 pattern
-        const next1 = self.peek() orelse return self.makeToken(.RedirectStderr, fd_str, start_line, start_column);
-        if (next1 != '&') return self.makeToken(.RedirectStderr, fd_str, start_line, start_column);
-        _ = try self.advance();
-
-        const next2 = self.peek() orelse return self.makeToken(.RedirectStderr, fd_str, start_line, start_column);
-        if (next2 != '1') return self.makeToken(.RedirectStderr, fd_str, start_line, start_column);
-        _ = try self.advance();
-
-        return self.makeToken(.RedirectBoth, "2>&1", start_line, start_column);
-    }
-
-    fn makeToken(self: *Self, token_type: TokenType, value: []const u8, line: types.LineNumber, column: types.ColumnNumber) Token {
-        _ = self;
-        return Token{
-            .ty = token_type,
-            .value = value,
-            .line = line,
-            .column = column,
-        };
     }
 };
 
-// security helper functions
-fn isShellMetacharacter(char: u8) bool {
-    return switch (char) {
-        ' ', '\t', '\n', '\r', '|', '&', ';', '(', ')', '<', '>',
-        '{', '}', '[', ']', '\'', '"', '`', '$', '\\', '#' => true,
+fn isOperator(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '\n', '|', '&', ';', '(', ')', '<', '>', '{', '}' => true,
         else => false,
     };
 }
 
-fn isKeyword(word: []const u8) bool {
-    const keywords = [_][]const u8{
-        "if", "then", "else", "elif", "fi",
-        "case", "esac", "for", "while", "until",
-        "do", "done", "in", "function",
-    };
-
-    for (keywords) |keyword| {
-        if (std.mem.eql(u8, word, keyword)) return true;
-    }
-    return false;
-}
-
-fn keywordToTokenType(word: []const u8) TokenType {
+fn classifyWord(word: []const u8) TokenType {
+    // keywords
     if (std.mem.eql(u8, word, "if")) return .If;
     if (std.mem.eql(u8, word, "then")) return .Then;
     if (std.mem.eql(u8, word, "else")) return .Else;

@@ -27,6 +27,7 @@ pub const parsererror = error{
     UnterminatedCommandSubstitution,
     StringTooLong,
     UnterminatedString,
+    UnterminatedExpansion,
     NumberTooLong,
     TokenTooLong,
     EmptyToken,
@@ -276,22 +277,52 @@ pub const Parser = struct {
                         const eq_pos = std.mem.indexOfScalar(u8, self.current_token.value, '=').?;
                         // This is an assignment like VAR=value
                         const token = self.current_token;
-                        try self.nextToken();
 
+                        // Extract name and value BEFORE calling nextToken()
+                        // because nextToken() may overwrite the lexer buffer
                         const name = token.value[0..eq_pos];
-                        const value = token.value[eq_pos + 1..];
+                        const value = token.value[eq_pos + 1 ..];
 
-                        // Create assignment node
-                        return self.builder.createassignment(name, value, token.line, token.column);
+                        // Create assignment node (duplicates strings into arena)
+                        const assignment = try self.builder.createassignment(name, value, token.line, token.column);
+                        try self.nextToken();
+                        return assignment;
                     } else {
                         // Regular word (or assignment as argument to a command)
                         const word = try self.parseword();
                         try words.append(self.builder.arena.allocator(), word);
                     }
                 },
-                .String, .DoubleQuotedString, .Integer => {
-                    const word = try self.parseword();
-                    try words.append(self.builder.arena.allocator(), word);
+                .String, .DoubleQuotedString => {
+                    // Check if this quoted token is an assignment (VAR="value")
+                    // Only treat as assignment if it's the first word
+                    if (words.items.len == 0 and std.mem.indexOfScalar(u8, self.current_token.value, '=') != null) {
+                        const eq_pos = std.mem.indexOfScalar(u8, self.current_token.value, '=').?;
+                        const token = self.current_token;
+
+                        // Extract name and value BEFORE calling nextToken()
+                        const name = token.value[0..eq_pos];
+                        const value = token.value[eq_pos + 1 ..];
+
+                        const assignment = try self.builder.createassignment(name, value, token.line, token.column);
+                        try self.nextToken();
+                        return assignment;
+                    } else {
+                        const word = try self.parseword();
+                        try words.append(self.builder.arena.allocator(), word);
+                    }
+                },
+                // keywords can be used as arguments (e.g., "echo done")
+                .Done, .Fi, .Else, .Elif, .Then, .Do, .In, .For, .While, .Until, .If, .Case, .Esac, .Function => {
+                    if (words.items.len > 0) {
+                        // treat keyword as word when it's an argument
+                        const token = self.current_token;
+                        const word = try self.builder.createword(token.value, token.line, token.column);
+                        try words.append(self.builder.arena.allocator(), word);
+                        try self.nextToken();
+                    } else {
+                        break; // keyword at start of command - not a simple command
+                    }
                 },
                 else => break,
             }
@@ -347,22 +378,12 @@ pub const Parser = struct {
 
         const token = self.current_token;
 
-        // determine node type before advancing (token still valid)
-        const node_type: ast.NodeType = switch (token.ty) {
-            .Word => .word,
-            .String => .string,
-            .DoubleQuotedString => .word, // expand like regular words
-            .Integer => .number,
-            else => return error.UnexpectedToken,
-        };
-
         // create node BEFORE nextToken to avoid buffer overwrite
         // (nextToken may reuse the buffer that token.value points to)
-        const node = switch (node_type) {
-            .word => try self.builder.createword(token.value, token.line, token.column),
-            .string => try self.builder.createstring(token.value, token.line, token.column),
-            .number => try self.builder.createnode(.number, token.value, &[_]*const ast.AstNode{}, token.line, token.column),
-            else => return error.InvalidSyntax,
+        const node = switch (token.ty) {
+            .Word, .DoubleQuotedString => try self.builder.createword(token.value, token.line, token.column),
+            .String => try self.builder.createstring(token.value, token.line, token.column),
+            else => return error.UnexpectedToken,
         };
 
         try self.nextToken();

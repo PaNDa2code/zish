@@ -30,15 +30,21 @@ pub fn main() void {
         return;
     }
 
-    // initialize shell
-    var shell = Shell.init(allocator) catch |err| {
+    // determine if interactive mode
+    const is_interactive = res.args.c == null and (res.positionals.len == 0 or res.positionals[0].len == 0);
+
+    // initialize shell (skip config loading for non-interactive mode)
+    const shell_instance = (if (is_interactive)
+        Shell.init(allocator)
+    else
+        Shell.initNonInteractive(allocator)) catch |err| {
         std.debug.print("zish: failed to initialize shell: {}\n", .{err});
         std.process.exit(1);
     };
-    defer shell.deinit();
+    defer shell_instance.deinit();
 
     if (res.args.@"debug-log-file") |log_path| {
-        shell.log_file = if (std.fs.path.isAbsolute(log_path))
+        shell_instance.log_file = if (std.fs.path.isAbsolute(log_path))
             std.fs.createFileAbsolute(log_path, .{}) catch |err| {
                 std.debug.print("zish: failed to create log file: {}\n", .{err});
                 std.process.exit(1);
@@ -58,22 +64,17 @@ pub fn main() void {
                 const key = std.fmt.bufPrint(&buf, "{d}", .{idx * 100 + arg_idx}) catch continue;
                 const key_copy = allocator.dupe(u8, key) catch continue;
                 const val_copy = allocator.dupe(u8, arg) catch continue;
-                shell.variables.put(key_copy, val_copy) catch {};
+                shell_instance.variables.put(key_copy, val_copy) catch {};
             }
         }
 
-        const exit_code = shell.executeCommand(command) catch |err| {
+        const exit_code = shell_instance.executeCommand(command) catch |err| {
             std.debug.print("zish: error executing command: {}\n", .{err});
             std.process.exit(1);
         };
 
-        // Add to history in non-interactive mode
-        if (shell.history) |h| {
-            h.addCommand(command, exit_code) catch {};
-        }
-
         // Flush stdout buffer before exit
-        shell.stdout().flush() catch {};
+        shell_instance.stdout().flush() catch {};
         std.process.exit(exit_code);
     } else if (res.positionals.len > 0 and res.positionals[0].len > 0) {
         // script file mode
@@ -86,7 +87,7 @@ pub fn main() void {
                 const key = std.fmt.bufPrint(&buf, "{d}", .{idx * 100 + arg_idx}) catch continue;
                 const key_copy = allocator.dupe(u8, key) catch continue;
                 const val_copy = allocator.dupe(u8, arg) catch continue;
-                shell.variables.put(key_copy, val_copy) catch {};
+                shell_instance.variables.put(key_copy, val_copy) catch {};
             }
         }
 
@@ -96,15 +97,15 @@ pub fn main() void {
         };
         defer allocator.free(script_content);
 
-        const exit_code = shell.executeCommand(script_content) catch |err| {
+        const exit_code = shell_instance.executeCommand(script_content) catch |err| {
             std.debug.print("zish: error executing script: {}\n", .{err});
             std.process.exit(1);
         };
-        shell.stdout().flush() catch {};
+        shell_instance.stdout().flush() catch {};
         std.process.exit(exit_code);
     } else {
         // interactive mode
-        shell.run() catch |err| {
+        shell_instance.run() catch |err| {
             std.debug.print("zish: error in interactive mode: {}\n", .{err});
             std.process.exit(1);
         };

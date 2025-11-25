@@ -78,12 +78,63 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     if (std.mem.eql(u8, cmd_name, "echo")) {
-        for (expanded_args.items[1..], 0..) |arg, i| {
-            if (i > 0) try shell.stdout().writeByte(' ');
-            try shell.stdout().writeAll(arg);
+        var interpret_escapes = false;
+        var print_newline = true;
+        var arg_start: usize = 1;
+
+        // parse flags
+        while (arg_start < expanded_args.items.len) {
+            const arg = expanded_args.items[arg_start];
+            if (arg.len >= 2 and arg[0] == '-') {
+                var valid_flag = true;
+                var has_e = false;
+                var has_n = false;
+                for (arg[1..]) |c| {
+                    switch (c) {
+                        'e' => has_e = true,
+                        'n' => has_n = true,
+                        'E' => {}, // disable escapes (default)
+                        else => {
+                            valid_flag = false;
+                            break;
+                        },
+                    }
+                }
+                if (valid_flag) {
+                    if (has_e) interpret_escapes = true;
+                    if (has_n) print_newline = false;
+                    arg_start += 1;
+                    continue;
+                }
+            }
+            break;
         }
-        try shell.stdout().writeByte('\n');
+
+        for (expanded_args.items[arg_start..], 0..) |arg, i| {
+            if (i > 0) try shell.stdout().writeByte(' ');
+            if (interpret_escapes) {
+                try writeEscaped(shell.stdout(), arg);
+            } else {
+                try shell.stdout().writeAll(arg);
+            }
+        }
+        if (print_newline) try shell.stdout().writeByte('\n');
         return 0;
+    }
+
+    // test builtin and [ alias
+    if (std.mem.eql(u8, cmd_name, "test") or std.mem.eql(u8, cmd_name, "[")) {
+        var test_args = expanded_args.items[1..];
+        // if [ command, check for closing ]
+        if (std.mem.eql(u8, cmd_name, "[")) {
+            if (test_args.len == 0 or !std.mem.eql(u8, test_args[test_args.len - 1], "]")) {
+                try shell.stdout().writeAll("[: missing ]\n");
+                return 2;
+            }
+            test_args = test_args[0 .. test_args.len - 1];
+        }
+        const result = evaluateTestExpr(test_args);
+        return if (result) 0 else 1;
     }
 
     if (std.mem.eql(u8, cmd_name, "pwd")) {
@@ -248,11 +299,35 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     if (std.mem.eql(u8, cmd_name, "set")) {
+        // set -- arg1 arg2 ... sets positional parameters
+        if (expanded_args.items.len >= 2 and std.mem.eql(u8, expanded_args.items[1], "--")) {
+            // clear existing positional parameters
+            var i: usize = 1;
+            while (i <= 99) : (i += 1) {
+                var num_buf: [16]u8 = undefined;
+                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch break;
+                if (shell.variables.fetchRemove(num_str)) |kv| {
+                    shell.allocator.free(kv.key);
+                    shell.allocator.free(kv.value);
+                } else break;
+            }
+            // set new positional parameters
+            for (expanded_args.items[2..], 1..) |arg, idx| {
+                var num_buf: [16]u8 = undefined;
+                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{idx}) catch continue;
+                try setShellVar(shell, num_str, arg);
+            }
+            // set $# (number of arguments)
+            var count_buf: [16]u8 = undefined;
+            const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{expanded_args.items.len - 2}) catch "0";
+            try setShellVar(shell, "#", count_str);
+            return 0;
+        }
         // set option [on|off]
         if (expanded_args.items.len < 2) {
-            try shell.stdout().writeAll("usage: set <option> [on|off]\n");
-            try shell.stdout().writeAll("options: git_prompt\n");
-            return 1;
+            try shell.stdout().writeAll("usage: set <option> [on|off] or set -- args...\n");
+            try shell.stdout().writeAll("options: git_prompt, vim\n");
+            return 0;
         }
         const option = expanded_args.items[1];
         const value = if (expanded_args.items.len > 2) expanded_args.items[2] else "on";
@@ -267,6 +342,14 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             return 1;
         }
         return 0;
+    }
+
+    // continue and break builtins - return special values to be handled by loops
+    if (std.mem.eql(u8, cmd_name, "continue")) {
+        return 253; // special value for continue
+    }
+    if (std.mem.eql(u8, cmd_name, "break")) {
+        return 254; // special value for break
     }
 
     if (std.mem.eql(u8, cmd_name, "history")) {
@@ -449,7 +532,15 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         shell.enableRawMode() catch {};
     };
 
-    var child = std.process.Child.init(expanded_args.items, shell.allocator);
+    // use cached path lookup for faster execution
+    var args_with_path = expanded_args.items;
+    if (shell.lookupCommand(cmd_name)) |full_path| {
+        // replace command name with full path
+        expanded_args.items[0] = full_path;
+        args_with_path = expanded_args.items;
+    }
+
+    var child = std.process.Child.init(args_with_path, shell.allocator);
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
     child.stdin_behavior = .Inherit;
@@ -496,20 +587,32 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
         pipe_fds.*[1] = -1;
     }
 
-    // cleanup pipes on error (fork failure, etc)
-    errdefer {
-        for (pipes) |pipe_fds| {
-            if (pipe_fds[0] != -1) std.posix.close(pipe_fds[0]);
-            if (pipe_fds[1] != -1) std.posix.close(pipe_fds[1]);
-        }
-    }
-
     for (pipes) |*pipe_fds| {
         pipe_fds.* = try std.posix.pipe();
     }
 
     var pids = try shell.allocator.alloc(std.posix.pid_t, num_commands);
     defer shell.allocator.free(pids);
+
+    // initialize pids to 0 so we can track which children were forked
+    for (pids) |*pid| {
+        pid.* = 0;
+    }
+
+    // cleanup pipes and kill already-forked children on error
+    errdefer {
+        for (pipes) |pipe_fds| {
+            if (pipe_fds[0] != -1) std.posix.close(pipe_fds[0]);
+            if (pipe_fds[1] != -1) std.posix.close(pipe_fds[1]);
+        }
+        // kill and reap any children that were already forked
+        for (pids) |pid| {
+            if (pid != 0) {
+                std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+                _ = std.posix.waitpid(pid, 0);
+            }
+        }
+    }
 
     for (node.children, 0..) |child, i| {
         const pid = try std.posix.fork();
@@ -636,6 +739,8 @@ pub fn evaluateList(shell: *Shell, node: *const ast.AstNode) !u8 {
     for (node.children) |child| {
         last_status = try evaluateAst(shell, child);
         shell.last_exit_code = last_status;
+        // propagate break/continue signals up
+        if (last_status == 253 or last_status == 254) return last_status;
     }
     return last_status;
 }
@@ -688,6 +793,12 @@ pub fn evaluateWhile(shell: *Shell, node: *const ast.AstNode) !u8 {
         if (condition != 0) break;
 
         last_status = try evaluateAst(shell, node.children[1]);
+        if (last_status == 254) break; // break
+        if (last_status == 253) { // continue
+            last_status = 0;
+            iterations += 1;
+            continue;
+        }
         iterations += 1;
     }
 
@@ -696,7 +807,7 @@ pub fn evaluateWhile(shell: *Shell, node: *const ast.AstNode) !u8 {
         return 1;
     }
 
-    return last_status;
+    return if (last_status == 254) 0 else last_status;
 }
 
 pub fn evaluateUntil(shell: *Shell, node: *const ast.AstNode) !u8 {
@@ -711,6 +822,12 @@ pub fn evaluateUntil(shell: *Shell, node: *const ast.AstNode) !u8 {
         if (condition == 0) break;
 
         last_status = try evaluateAst(shell, node.children[1]);
+        if (last_status == 254) break; // break
+        if (last_status == 253) { // continue
+            last_status = 0;
+            iterations += 1;
+            continue;
+        }
         iterations += 1;
     }
 
@@ -730,8 +847,9 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
     const values = node.children[1 .. node.children.len - 1];
 
     var last_status: u8 = 0;
+    var should_break = false;
 
-    for (values) |value_node| {
+    outer: for (values) |value_node| {
         const var_expanded = if (value_node.node_type == .string)
             try shell.allocator.dupe(u8, value_node.value)
         else
@@ -757,10 +875,18 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
             try shell.variables.put(name_copy, value_copy);
 
             last_status = try evaluateAst(shell, body);
+            if (last_status == 254) { // break
+                should_break = true;
+                break :outer;
+            }
+            if (last_status == 253) { // continue
+                last_status = 0;
+                continue;
+            }
         }
     }
 
-    return last_status;
+    return if (should_break) 0 else last_status;
 }
 
 pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
@@ -814,8 +940,8 @@ fn evaluateTestPrimary(args: []const []const u8) bool {
         const fs = std.fs;
 
         return switch (first[1]) {
-            'e' => blk: {
-                // file exists
+            'e', 'a' => blk: {
+                // file exists (-e or -a)
                 fs.cwd().access(path, .{}) catch break :blk false;
                 break :blk true;
             },
@@ -1026,4 +1152,88 @@ pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !
     }
 
     return result;
+}
+
+// helper for echo -e escape sequences
+fn writeEscaped(writer: anytype, input: []const u8) !void {
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '\\' and i + 1 < input.len) {
+            const next = input[i + 1];
+            switch (next) {
+                'n' => {
+                    try writer.writeByte('\n');
+                    i += 2;
+                },
+                't' => {
+                    try writer.writeByte('\t');
+                    i += 2;
+                },
+                'r' => {
+                    try writer.writeByte('\r');
+                    i += 2;
+                },
+                '\\' => {
+                    try writer.writeByte('\\');
+                    i += 2;
+                },
+                'a' => {
+                    try writer.writeByte(0x07); // bell
+                    i += 2;
+                },
+                'b' => {
+                    try writer.writeByte(0x08); // backspace
+                    i += 2;
+                },
+                'e' => {
+                    try writer.writeByte(0x1b); // escape
+                    i += 2;
+                },
+                'f' => {
+                    try writer.writeByte(0x0c); // form feed
+                    i += 2;
+                },
+                'v' => {
+                    try writer.writeByte(0x0b); // vertical tab
+                    i += 2;
+                },
+                '0' => {
+                    // octal escape \0nnn
+                    var val: u8 = 0;
+                    var j: usize = i + 2;
+                    var digits: usize = 0;
+                    while (j < input.len and digits < 3) {
+                        const c = input[j];
+                        if (c >= '0' and c <= '7') {
+                            val = val * 8 + (c - '0');
+                            j += 1;
+                            digits += 1;
+                        } else break;
+                    }
+                    try writer.writeByte(val);
+                    i = j;
+                },
+                'x' => {
+                    // hex escape \xHH
+                    if (i + 3 < input.len) {
+                        const hex = input[i + 2 .. i + 4];
+                        if (std.fmt.parseInt(u8, hex, 16)) |val| {
+                            try writer.writeByte(val);
+                            i += 4;
+                            continue;
+                        } else |_| {}
+                    }
+                    try writer.writeByte(input[i]);
+                    i += 1;
+                },
+                else => {
+                    try writer.writeByte(input[i]);
+                    i += 1;
+                },
+            }
+        } else {
+            try writer.writeByte(input[i]);
+            i += 1;
+        }
+    }
 }

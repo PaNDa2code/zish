@@ -1,27 +1,33 @@
 # zish
 
-opinionated shell for personal use. targets full bash/sh compatibility.
+fast, opinionated shell written in zig. for the brave.
 
-## Features
+## features
 
-- vim-style editing modes
-- tab completion
-- command history
-- configurable aliases (~/.zishrc)
-- colorized output
+- vim mode (`set vim on`)
+- git prompt (`set git_prompt on`)
+- tab completion with common prefix
+- persistent history
+- aliases & functions
+- `${VAR:-default}` parameter expansion
+- `[[ ]]` test expressions
+- pipes, redirects, `&&`, `||`
+- `$(cmd)` and `$((math))`
+- builtins: `cd`, `-`, `..`, `...`, `local`, `export`
 
-## Build
+## build
 
 ```
 zig build
 ./zig-out/bin/zish
 ```
 
-## Todo
+## config
 
-- pipes/redirection
-- copy/paste support
-- terminal resizing
-- multi-line editing
-- proper vim visual mode
-- job control
+```
+cp example.zishrc ~/.zishrc
+```
+
+## status
+
+v0.5.0 - daily driver ready, expect rough edges

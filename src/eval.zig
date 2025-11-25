@@ -275,6 +275,16 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     child.stderr_behavior = .Inherit;
     child.stdin_behavior = .Inherit;
 
+    // ignore SIGINT in shell while child runs (child will receive it)
+    var old_sigint: std.posix.Sigaction = undefined;
+    const ignore_action = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
+
     const term = child.spawnAndWait() catch {
         try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
         return 127;
@@ -282,6 +292,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     return switch (term) {
         .Exited => |code| code,
+        .Signal => |sig| @truncate(128 + sig),
         else => 127,
     };
 }
@@ -340,11 +351,23 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
         std.posix.close(pipe_fds[1]);
     }
 
+    // ignore SIGINT in shell while waiting for pipeline (children will receive it)
+    var old_sigint: std.posix.Sigaction = undefined;
+    const ignore_action = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
+
     var last_status: u8 = 0;
     for (pids) |pid| {
         const result = std.posix.waitpid(pid, 0);
         if (std.posix.W.IFEXITED(result.status)) {
             last_status = std.posix.W.EXITSTATUS(result.status);
+        } else if (std.posix.W.IFSIGNALED(result.status)) {
+            last_status = @truncate(128 + std.posix.W.TERMSIG(result.status));
         } else {
             last_status = 127;
         }

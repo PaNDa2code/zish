@@ -136,13 +136,32 @@ pub const History = struct {
         // Calculate hash for deduplication
         const command_hash = std.hash.Wyhash.hash(0, command);
 
-        // Check if command already exists - if so, just update frequency and timestamp
+        // Check if command already exists - move to end for recency
         if (self.hash_map.get(command_hash)) |existing_index| {
-            var entry = &self.entries.items[existing_index];
-            entry.frequency = @min(65535, entry.frequency + 1); // Prevent overflow
+            var entry = self.entries.items[existing_index];
+            entry.frequency = @min(65535, entry.frequency + 1);
             entry.timestamp = @intCast(std.time.timestamp());
             entry.exit_code = exit_code;
             entry.flags = if (exit_code == 0) HistoryEntry.SUCCESSFUL_FLAG else 0;
+
+            // move to end: swap with last entry, then update in place
+            const last_index: u32 = @intCast(self.entries.items.len - 1);
+            if (existing_index != last_index) {
+                // swap entries
+                const last_entry = self.entries.items[last_index];
+                self.entries.items[existing_index] = last_entry;
+                self.entries.items[last_index] = entry;
+
+                // update hash_map for swapped entry
+                try self.hash_map.put(last_entry.command_hash, existing_index);
+                try self.hash_map.put(command_hash, last_index);
+            } else {
+                // already at end, just update in place
+                self.entries.items[last_index] = entry;
+            }
+
+            self.dirty = true;
+            try self.saveEntry(entry);
             return;
         }
 
@@ -468,14 +487,26 @@ pub const History = struct {
     fn mergeEntry(self: *Self, disk_entry: log_mod.EntryData) !void {
         // check if exists in memory
         if (self.hash_map.get(disk_entry.command_hash)) |existing_index| {
-            // merge: higher frequency + newer timestamp wins
-            var memory_entry = &self.entries.items[existing_index];
+            // merge: higher frequency + newer timestamp wins, move to end for recency
+            var memory_entry = self.entries.items[existing_index];
 
             memory_entry.frequency = @max(memory_entry.frequency, disk_entry.frequency);
-            const current_time: u32 = @intCast(std.time.timestamp());
-            memory_entry.timestamp = @max(memory_entry.timestamp, current_time);
-            memory_entry.flags |= disk_entry.flags; // union of flags
+            memory_entry.timestamp = @intCast(std.time.timestamp()); // use current time for recency
+            memory_entry.flags |= disk_entry.flags;
             memory_entry.exit_code = disk_entry.exit_code;
+
+            // move to end for recency (same logic as addCommand)
+            const last_index: u32 = @intCast(self.entries.items.len - 1);
+            if (existing_index != last_index) {
+                const last_entry = self.entries.items[last_index];
+                self.entries.items[existing_index] = last_entry;
+                self.entries.items[last_index] = memory_entry;
+
+                try self.hash_map.put(last_entry.command_hash, existing_index);
+                try self.hash_map.put(disk_entry.command_hash, last_index);
+            } else {
+                self.entries.items[last_index] = memory_entry;
+            }
         } else {
             // add new entry from disk
             if (self.string_pool_used + disk_entry.command.len > self.string_pool.len) {

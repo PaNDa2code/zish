@@ -11,6 +11,7 @@ const tty = @import("tty.zig");
 const input_mod = @import("input.zig");
 const completion_mod = @import("completion.zig");
 const eval = @import("eval.zig");
+const git = @import("git.zig");
 
 // Re-export from input module
 const VimMode = input_mod.VimMode;
@@ -79,6 +80,9 @@ completion_original_len: usize = 0,
 completion_pattern_len: usize = 0,
 completion_menu_lines: usize = 0,
 completion_displayed: bool = false,
+
+// git info display (set via .zishrc: set git_prompt on)
+show_git_info: bool = false,
 
 // track displayed command lines for proper clearing
 displayed_cmd_lines: usize = 1,
@@ -390,7 +394,27 @@ fn printFancyPrompt(self: *Shell) !void {
         .normal => "N",
     } else "E"; // E for emacs/normal editing mode
 
-    // mild colorful prompt: [mode] user@host ~/path $
+    // git info on separate line above prompt (if enabled)
+    if (self.show_git_info) {
+        if (git.getInfo(self.allocator)) |info| {
+            var git_info = info;
+            defer git_info.deinit(self.allocator);
+
+            const dirty_indicator: []const u8 = if (git_info.dirty) "*" else "";
+            if (git_info.commit.len > 0) {
+                try self.stdout().print("{f}{s}{f} {s}{s}\n", .{
+                    tty.Color.magenta, git_info.branch, tty.Color.reset,
+                    git_info.commit, dirty_indicator,
+                });
+            } else {
+                try self.stdout().print("{f}{s}{s}{f}\n", .{
+                    tty.Color.magenta, git_info.branch, dirty_indicator, tty.Color.reset,
+                });
+            }
+        }
+    }
+
+    // clean 80-char prompt: [mode] user@host ~/path $
     try self.stdout().print("{f}[{f}{s}{f}] {f}{s}@{s}{f} {f}{s}{f} $ ", .{
         tty.Style.bold,  mode_color,   mode_indicator,  tty.Color.reset,
         Colors.userhost, user,         hostname,        tty.Color.reset,
@@ -1449,6 +1473,173 @@ fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
     self.cursor_pos = copy_len;
 }
 
+fn tryGitCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    // check if command starts with "git "
+    if (!std.mem.startsWith(u8, cmd, "git ")) return false;
+    if (!git.isRepo()) return false;
+
+    // parse git subcommand
+    const after_git = cmd[4..];
+    var parts = std.mem.splitScalar(u8, after_git, ' ');
+    const subcommand = parts.next() orelse return false;
+
+    // get matches based on subcommand
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    const pattern = word_result.word;
+
+    if (std.mem.eql(u8, subcommand, "add") or
+        std.mem.eql(u8, subcommand, "restore") or
+        std.mem.eql(u8, subcommand, "diff"))
+    {
+        // complete with modified/deleted/untracked files
+        if (git.getStatus(self.allocator)) |s| {
+            var status = s;
+            defer status.deinit();
+
+            for (status.modified.items) |file| {
+                if (std.mem.startsWith(u8, file, pattern)) {
+                    matches.append(self.allocator, self.allocator.dupe(u8, file) catch continue) catch {};
+                }
+            }
+            for (status.deleted.items) |file| {
+                if (std.mem.startsWith(u8, file, pattern)) {
+                    matches.append(self.allocator, self.allocator.dupe(u8, file) catch continue) catch {};
+                }
+            }
+            for (status.untracked.items) |file| {
+                if (std.mem.startsWith(u8, file, pattern)) {
+                    matches.append(self.allocator, self.allocator.dupe(u8, file) catch continue) catch {};
+                }
+            }
+        }
+    } else if (std.mem.eql(u8, subcommand, "checkout") or
+        std.mem.eql(u8, subcommand, "switch") or
+        std.mem.eql(u8, subcommand, "merge") or
+        std.mem.eql(u8, subcommand, "rebase"))
+    {
+        // complete with branches
+        try self.getGitBranches(&matches, pattern);
+    } else if (std.mem.eql(u8, subcommand, "branch")) {
+        // check for -d flag
+        var has_delete = false;
+        while (parts.next()) |part| {
+            if (std.mem.eql(u8, part, "-d") or std.mem.eql(u8, part, "-D") or
+                std.mem.eql(u8, part, "--delete"))
+            {
+                has_delete = true;
+                break;
+            }
+        }
+        if (has_delete) {
+            try self.getGitBranches(&matches, pattern);
+        }
+    } else {
+        return false; // not a git subcommand we handle
+    }
+
+    if (matches.items.len == 0) return false;
+
+    // apply completion
+    if (matches.items.len == 1) {
+        return try self.applySingleCompletion(matches.items[0], word_result);
+    } else {
+        return try self.showCompletionMatches(&matches, word_result, pattern);
+    }
+}
+
+fn getGitBranches(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []const u8) !void {
+    // read branches from .git/refs/heads/
+    const refs_dir = std.fs.cwd().openDir(".git/refs/heads", .{ .iterate = true }) catch return;
+    var dir = refs_dir;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .file and std.mem.startsWith(u8, entry.name, pattern)) {
+            const branch = try self.allocator.dupe(u8, entry.name);
+            try matches.append(self.allocator, branch);
+        }
+    }
+}
+
+fn applySingleCompletion(self: *Shell, match: []const u8, word_result: WordResult) !bool {
+    const pattern = word_result.word;
+    const word_end = word_result.end;
+    const comp_str = match[pattern.len..];
+
+    const new_len = self.current_command_len + comp_str.len;
+    if (new_len >= self.current_command.len) return error.InputTooLong;
+
+    if (word_end < self.current_command_len) {
+        @memmove(
+            self.current_command[word_end + comp_str.len .. new_len],
+            self.current_command[word_end..self.current_command_len],
+        );
+    }
+
+    @memcpy(self.current_command[word_end .. word_end + comp_str.len], comp_str);
+    self.current_command_len = new_len;
+    self.cursor_pos = word_end + comp_str.len;
+    try self.redrawLine();
+    return true;
+}
+
+fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word_result: WordResult, pattern: []const u8) !bool {
+    // find longest common prefix among all matches
+    if (matches.items.len == 0) return false;
+
+    var common_prefix_len: usize = matches.items[0].len;
+    for (matches.items[1..]) |match| {
+        var i: usize = 0;
+        while (i < common_prefix_len and i < match.len and matches.items[0][i] == match[i]) : (i += 1) {}
+        common_prefix_len = i;
+    }
+
+    // if common prefix is longer than pattern, complete to that first
+    if (common_prefix_len > pattern.len) {
+        const common_prefix = matches.items[0][0..common_prefix_len];
+        const comp_str = common_prefix[pattern.len..];
+        const word_end = word_result.end;
+
+        // insert completion
+        if (word_end + comp_str.len < types.MAX_COMMAND_LENGTH) {
+            // shift existing text to make room
+            const tail_len = self.current_command_len - word_end;
+            if (tail_len > 0) {
+                std.mem.copyBackwards(u8, self.current_command[word_end + comp_str.len ..], self.current_command[word_end .. word_end + tail_len]);
+            }
+            @memcpy(self.current_command[word_end .. word_end + comp_str.len], comp_str);
+            self.current_command_len += comp_str.len;
+            self.cursor_pos = word_end + comp_str.len;
+            try self.redrawLine();
+        }
+        return true;
+    }
+
+    // common prefix equals pattern, show all matches
+    self.exitCompletionMode();
+
+    for (matches.items) |match| {
+        const owned = try self.allocator.dupe(u8, match);
+        try self.completion_matches.append(self.allocator, owned);
+    }
+
+    self.completion_mode = true;
+    self.completion_index = self.completion_matches.items.len;
+    self.completion_word_start = word_result.start;
+    self.completion_word_end = word_result.end;
+    self.completion_original_len = self.current_command_len;
+    self.completion_pattern_len = word_result.word.len;
+
+    try self.displayCompletions();
+    return true;
+}
+
 fn handleTabCompletion(self: *Shell) !void {
     if (self.current_command_len == 0) return;
 
@@ -1458,6 +1649,9 @@ fn handleTabCompletion(self: *Shell) !void {
 
     const word = word_result.word;
     const word_end = word_result.end;
+
+    // check for git-aware completion
+    if (try self.tryGitCompletion(cmd, word_result)) return;
 
     // determine base directory and search pattern
     // expand ~ to home directory if needed
@@ -1604,9 +1798,35 @@ fn handleTabCompletion(self: *Shell) !void {
         self.cursor_pos = word_end + comp_str.len;
         try self.redrawLine();
     } else {
-        // multiple matches - enter completion mode
-        // store matches and word boundaries
-        self.exitCompletionMode(); // clear any previous state
+        // multiple matches - first try common prefix completion
+        var common_prefix_len: usize = matches.items[0].len;
+        for (matches.items[1..]) |match| {
+            var i: usize = 0;
+            while (i < common_prefix_len and i < match.len and matches.items[0][i] == match[i]) : (i += 1) {}
+            common_prefix_len = i;
+        }
+
+        // if common prefix is longer than pattern, complete to that first
+        if (common_prefix_len > pattern.len) {
+            const common_prefix = matches.items[0][0..common_prefix_len];
+            const comp_str = common_prefix[pattern.len..];
+
+            // insert completion
+            if (word_end + comp_str.len < types.MAX_COMMAND_LENGTH) {
+                const tail_len = self.current_command_len - word_end;
+                if (tail_len > 0) {
+                    std.mem.copyBackwards(u8, self.current_command[word_end + comp_str.len ..], self.current_command[word_end .. word_end + tail_len]);
+                }
+                @memcpy(self.current_command[word_end .. word_end + comp_str.len], comp_str);
+                self.current_command_len += comp_str.len;
+                self.cursor_pos = word_end + comp_str.len;
+                try self.redrawLine();
+            }
+            return;
+        }
+
+        // common prefix equals pattern - enter completion mode
+        self.exitCompletionMode();
 
         for (matches.items) |match| {
             const owned = try self.allocator.dupe(u8, match);

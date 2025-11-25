@@ -146,6 +146,28 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         return 0;
     }
 
+    if (std.mem.eql(u8, cmd_name, "set")) {
+        // set option [on|off]
+        if (expanded_args.items.len < 2) {
+            try shell.stdout().writeAll("usage: set <option> [on|off]\n");
+            try shell.stdout().writeAll("options: git_prompt\n");
+            return 1;
+        }
+        const option = expanded_args.items[1];
+        const value = if (expanded_args.items.len > 2) expanded_args.items[2] else "on";
+        const enabled = std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
+
+        if (std.mem.eql(u8, option, "git_prompt")) {
+            shell.show_git_info = enabled;
+        } else if (std.mem.eql(u8, option, "vim")) {
+            shell.vim_mode_enabled = enabled;
+        } else {
+            try shell.stdout().print("set: unknown option: {s}\n", .{option});
+            return 1;
+        }
+        return 0;
+    }
+
     if (std.mem.eql(u8, cmd_name, "history")) {
         const h = shell.history orelse {
             try shell.stdout().writeAll("history: not available\n");
@@ -219,8 +241,46 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
         // check if already password protected
         const already_protected = crypto_mod.isPasswordModeEnabled(shell.allocator);
+        const log_mod = @import("history_log.zig");
 
-        // prompt for password
+        // if already protected, need old password to decrypt existing history atomically
+        var old_entries: ?[]log_mod.EntryData = null;
+        defer {
+            if (old_entries) |entries| {
+                for (entries) |entry| {
+                    shell.allocator.free(entry.command);
+                }
+                shell.allocator.free(entries);
+            }
+        }
+
+        if (already_protected) {
+            const old_password = try crypto_mod.promptPassword(shell.allocator, "current password: ");
+            defer shell.allocator.free(old_password);
+
+            if (old_password.len == 0) {
+                try shell.stdout().writeAll("password cannot be empty\n");
+                return 1;
+            }
+
+            // derive old key and read all history entries from disk
+            const old_key = try crypto_mod.deriveKeyFromPassword(old_password, shell.allocator);
+
+            // validate old password by reading entries
+            old_entries = log_mod.readAllWithKey(shell.allocator, old_key) catch |err| {
+                if (err == error.AuthenticationFailed) {
+                    try shell.stdout().writeAll("wrong password\n");
+                    return 1;
+                }
+                return err;
+            };
+
+            if (old_entries.?.len == 0) {
+                try shell.stdout().writeAll("warning: no history entries found (wrong password?)\n");
+            }
+        }
+
+        // prompt for new password
         const new_password = try crypto_mod.promptPassword(shell.allocator, "new password: ");
         defer shell.allocator.free(new_password);
 
@@ -238,12 +298,19 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             return 1;
         }
 
+        // derive new key
+        const new_key = try crypto_mod.deriveKeyFromPassword(new_password, shell.allocator);
+
         // check if history is available
         if (shell.history) |h| {
-            // derive new key from password
-            const new_key = try crypto_mod.deriveKeyFromPassword(new_password, shell.allocator);
+            // if we have old entries from disk, merge them into history first
+            if (old_entries) |entries| {
+                for (entries) |entry| {
+                    h.mergeEntry(entry) catch {};
+                }
+            }
 
-            // re-encrypt history with new key
+            // re-encrypt all history with new key
             try h.reEncryptWithKey(new_key);
         }
 

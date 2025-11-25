@@ -102,6 +102,14 @@ pub const CryptoContext = struct {
         };
     }
 
+    /// init with a specific key (for re-encryption)
+    pub fn initWithKey(allocator: std.mem.Allocator, key: [KEY_LEN]u8) !CryptoContext {
+        return CryptoContext{
+            .key = key,
+            .allocator = allocator,
+        };
+    }
+
     pub fn deinit(self: *CryptoContext) void {
         // zero sensitive data
         @memset(&self.key, 0);

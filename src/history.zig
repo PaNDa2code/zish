@@ -446,11 +446,9 @@ pub const History = struct {
             self.allocator.free(entries);
         }
 
-        // merge with in-memory entries
+        // merge with in-memory entries (silently skip failures)
         for (entries) |entry| {
-            self.mergeEntry(entry) catch |err| {
-                std.log.warn("failed to merge entry: {}", .{err});
-            };
+            self.mergeEntry(entry) catch {};
         }
     }
 
@@ -484,7 +482,7 @@ pub const History = struct {
     }
 
     /// merge single entry from disk into memory
-    fn mergeEntry(self: *Self, disk_entry: log_mod.EntryData) !void {
+    pub fn mergeEntry(self: *Self, disk_entry: log_mod.EntryData) !void {
         // check if exists in memory
         if (self.hash_map.get(disk_entry.command_hash)) |existing_index| {
             // merge: higher frequency + newer timestamp wins, move to end for recency

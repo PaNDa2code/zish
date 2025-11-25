@@ -257,10 +257,8 @@ pub const LogReader = struct {
         );
         defer self.allocator.free(log_path);
 
-        self.readFile(log_path, &entries) catch |err| {
-            if (err != error.FileNotFound) {
-                std.log.warn("failed to read log: {}", .{err});
-            }
+        self.readFile(log_path, &entries) catch {
+            // silently ignore - file might not exist or be corrupted
         };
 
         return entries.toOwnedSlice(self.allocator);
@@ -280,26 +278,17 @@ pub const LogReader = struct {
             };
 
             if (n == 0) break; // eof
-            if (n < @sizeOf(EntryHeader)) {
-                std.log.warn("incomplete header at end of log, skipping", .{});
-                break;
-            }
+            if (n < @sizeOf(EntryHeader)) break; // truncated file
 
             // validate header
-            header.validate() catch |err| {
-                std.log.warn("invalid header: {}, skipping rest of log", .{err});
-                break;
-            };
+            header.validate() catch break; // corrupted/old format
 
             // read encrypted data
             const encrypted = try self.allocator.alloc(u8, header.entry_len);
             defer self.allocator.free(encrypted);
 
             const data_read = try file.readAll(encrypted);
-            if (data_read < header.entry_len) {
-                std.log.warn("incomplete entry at end of log, skipping", .{});
-                break;
-            }
+            if (data_read < header.entry_len) break; // truncated entry
 
             // create AAD same as during encryption (manual serialization)
             var aad_buf: [24]u8 = undefined;
@@ -312,16 +301,14 @@ pub const LogReader = struct {
             std.mem.writeInt(u64, aad_buf[8..16], header.sequence, .little);
             std.mem.writeInt(u64, aad_buf[16..24], header.timestamp, .little);
 
-            // decrypt
-            const plaintext = self.crypto.decrypt(encrypted, &aad_buf) catch |err| {
-                std.log.warn("failed to decrypt entry: {}, skipping", .{err});
+            // decrypt (silently skip entries from old keys)
+            const plaintext = self.crypto.decrypt(encrypted, &aad_buf) catch {
                 continue;
             };
             defer self.allocator.free(plaintext);
 
-            // deserialize
-            const entry = EntryData.deserialize(plaintext, self.allocator) catch |err| {
-                std.log.warn("failed to deserialize entry: {}, skipping", .{err});
+            // deserialize (silently skip malformed entries)
+            const entry = EntryData.deserialize(plaintext, self.allocator) catch {
                 continue;
             };
 
@@ -333,6 +320,17 @@ pub const LogReader = struct {
 fn getLogDir(allocator: std.mem.Allocator) ![]u8 {
     const home = posix.getenv("HOME") orelse return error.NoHomeDir;
     return std.fmt.allocPrint(allocator, "{s}/.config/zish/history.d", .{home});
+}
+
+/// read all entries with a specific key (for password change)
+pub fn readAllWithKey(allocator: std.mem.Allocator, key: [32]u8) ![]EntryData {
+    var temp_crypto = try CryptoContext.initWithKey(allocator, key);
+    defer temp_crypto.deinit();
+
+    var reader = try LogReader.init(allocator, &temp_crypto);
+    defer reader.deinit();
+
+    return reader.readAll();
 }
 
 fn generateInstanceId() u8 {

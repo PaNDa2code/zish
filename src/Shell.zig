@@ -1672,6 +1672,19 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     return exit_code;
 }
 pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
+    // Fast path: if no special chars, just duplicate the input
+    const needs_expansion = blk: {
+        if (input.len > 0 and input[0] == '~') break :blk true;
+        for (input) |c| {
+            if (c == '$' or c == '`') break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (!needs_expansion) {
+        return try self.allocator.dupe(u8, input);
+    }
+
     // Simple variable expansion - replace $VAR with variable value
     var result = try std.ArrayList(u8).initCapacity(self.allocator, input.len);
     defer result.deinit(self.allocator);
@@ -1946,7 +1959,7 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
     return try result.toOwnedSlice(self.allocator);
 }
 
-fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
+pub fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
     var trimmed = std.mem.trim(u8, expr, " \t\n\r");
     if (trimmed.len == 0) return 0;
 

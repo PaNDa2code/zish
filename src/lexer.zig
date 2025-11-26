@@ -15,6 +15,7 @@ pub const TokenType = enum {
     Or,             // ||
     Background,     // &
     Semicolon,      // ;
+    DoubleSemi,     // ;;
     NewLine,        // \n
 
     // redirects
@@ -269,6 +270,10 @@ pub const Lexer = struct {
                         },
                         ';' => {
                             _ = self.advance();
+                            if (self.peek() == @as(u8, ';')) {
+                                _ = self.advance();
+                                return self.makeTokenValue(.DoubleSemi, ";;");
+                            }
                             return self.makeTokenValue(.Semicolon, ";");
                         },
                         '\n' => {

@@ -19,7 +19,7 @@ pub fn expandGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]const 
     }
 }
 
-fn hasGlobChars(pattern: []const u8) bool {
+pub fn hasGlobChars(pattern: []const u8) bool {
     for (pattern) |c| {
         if (c == '*' or c == '?' or c == '[') return true;
     }
@@ -124,7 +124,7 @@ fn walkRecursive(
     }
 }
 
-fn matchGlob(pattern: []const u8, text: []const u8) bool {
+pub fn matchGlob(pattern: []const u8, text: []const u8) bool {
     return matchGlobImpl(pattern, text, 0, 0);
 }
 

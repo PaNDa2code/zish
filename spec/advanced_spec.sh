@@ -13,6 +13,7 @@ Describe 'zish advanced functionality'
 
     It 'skips second command with && on failure'
       When call zish "false && echo should_not_appear"
+      The status should eq 1
       The output should not include "should_not_appear"
     End
 

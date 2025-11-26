@@ -20,6 +20,7 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
         .subshell => evaluateSubshell(shell, node),
         .test_expression => evaluateTest(shell, node),
         .function_def => evaluateFunctionDef(shell, node),
+        .case_statement => evaluateCase(shell, node),
         else => {
             try shell.stdout().writeAll("unsupported AST node type\n");
             return 1;
@@ -27,31 +28,176 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
     };
 }
 
+// Fast path for [ and test builtins - uses stack buffers to avoid allocations
+fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
+    const is_bracket = node.children[0].value.len == 1 and node.children[0].value[0] == '[';
+
+    // Stack-allocated buffers for expanded arguments (max 8 args, 256 bytes each)
+    var arg_buffers: [8][256]u8 = undefined;
+    var arg_slices: [8][]const u8 = undefined;
+    var arg_count: usize = 0;
+
+    // Skip command name ([ or test) and closing ] if present
+    const start_idx: usize = 1;
+    var end_idx = node.children.len;
+
+    // For [ command, check for closing ]
+    if (is_bracket and end_idx > start_idx) {
+        const last = node.children[end_idx - 1].value;
+        if (last.len == 1 and last[0] == ']') {
+            end_idx -= 1;
+        } else {
+            try shell.stdout().writeAll("[: missing ]\n");
+            return 2;
+        }
+    }
+
+    // Expand arguments into stack buffers
+    for (node.children[start_idx..end_idx]) |arg_node| {
+        if (arg_count >= 8) break; // max args
+
+        const arg = arg_node.value;
+        const dest = &arg_buffers[arg_count];
+
+        // Fast variable expansion into stack buffer
+        const expanded_len = try expandVariableFast(shell, arg, dest);
+        arg_slices[arg_count] = dest[0..expanded_len];
+        arg_count += 1;
+    }
+
+    // Evaluate test expression with stack-allocated args
+    const result = evaluateTestExpr(arg_slices[0..arg_count]);
+    return if (result) 0 else 1;
+}
+
+// Fast variable expansion that writes to a provided buffer (no allocation)
+fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
+    // Fast path: no variables
+    if (std.mem.indexOfScalar(u8, input, '$') == null) {
+        const len = @min(input.len, 256);
+        @memcpy(dest[0..len], input[0..len]);
+        return len;
+    }
+
+    var out_pos: usize = 0;
+    var i: usize = 0;
+
+    while (i < input.len and out_pos < 256) {
+        if (input[i] == '$' and i + 1 < input.len) {
+            i += 1;
+
+            // Handle $? (exit code)
+            if (input[i] == '?') {
+                const exit_str = std.fmt.bufPrint(dest[out_pos..], "{d}", .{shell.last_exit_code}) catch break;
+                out_pos += exit_str.len;
+                i += 1;
+                continue;
+            }
+
+            // Handle $((expr))
+            if (i + 1 < input.len and input[i] == '(' and input[i + 1] == '(') {
+                i += 2;
+                const expr_start = i;
+                var paren_count: u32 = 2;
+                while (i < input.len and paren_count > 0) {
+                    if (input[i] == '(') paren_count += 1;
+                    if (input[i] == ')') paren_count -= 1;
+                    if (paren_count > 0) i += 1;
+                }
+                if (paren_count == 0 and i > 0) {
+                    const expr = input[expr_start .. i - 1];
+                    i += 1; // skip final )
+                    const arith_result = try shell.evaluateArithmetic(expr);
+                    const result_str = std.fmt.bufPrint(dest[out_pos..], "{d}", .{arith_result}) catch break;
+                    out_pos += result_str.len;
+                    continue;
+                }
+            }
+
+            // Simple $VAR
+            const name_start = i;
+            while (i < input.len and (std.ascii.isAlphanumeric(input[i]) or input[i] == '_')) {
+                i += 1;
+            }
+
+            if (i > name_start) {
+                const var_name = input[name_start..i];
+                // Look up in shell variables first, then env
+                if (shell.variables.get(var_name)) |value| {
+                    const copy_len = @min(value.len, 256 - out_pos);
+                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
+                    out_pos += copy_len;
+                } else if (std.posix.getenv(var_name)) |value| {
+                    const copy_len = @min(value.len, 256 - out_pos);
+                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
+                    out_pos += copy_len;
+                }
+            } else {
+                // Lone $
+                if (out_pos < 256) {
+                    dest[out_pos] = '$';
+                    out_pos += 1;
+                }
+            }
+        } else {
+            dest[out_pos] = input[i];
+            out_pos += 1;
+            i += 1;
+        }
+    }
+
+    return out_pos;
+}
+
 pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
 
-    // expand command name (for ~/path/to/cmd)
+    // Fast path for test builtin - avoid allocations in tight loops
     const raw_cmd = node.children[0].value;
+    if ((raw_cmd.len == 1 and raw_cmd[0] == '[') or std.mem.eql(u8, raw_cmd, "test")) {
+        return evaluateTestBuiltinFast(shell, node);
+    }
+
+    // expand command name (for ~/path/to/cmd)
     const cmd_name = try shell.expandVariables(raw_cmd);
     defer shell.allocator.free(cmd_name);
 
     // alias expansion - substitute alias value for command name
+    // but prevent infinite recursion for self-referencing aliases like "alias ls='ls --color=auto'"
     if (shell.aliases.get(cmd_name)) |alias_value| {
-        // build new command: alias_value + remaining args
-        var new_cmd = std.ArrayListUnmanaged(u8){};
-        defer new_cmd.deinit(shell.allocator);
+        // check if alias value starts with the same command (self-reference)
+        const first_word_end = std.mem.indexOfScalar(u8, alias_value, ' ') orelse alias_value.len;
+        const first_word = alias_value[0..first_word_end];
 
-        try new_cmd.appendSlice(shell.allocator, alias_value);
+        // skip expansion if alias is self-referencing (e.g., ls -> ls --color=auto)
+        if (!std.mem.eql(u8, first_word, cmd_name)) {
+            // build new command: alias_value + remaining args
+            var new_cmd = std.ArrayListUnmanaged(u8){};
+            defer new_cmd.deinit(shell.allocator);
 
-        // append remaining arguments
-        for (node.children[1..]) |arg_node| {
-            try new_cmd.append(shell.allocator, ' ');
-            try new_cmd.appendSlice(shell.allocator, arg_node.value);
+            try new_cmd.appendSlice(shell.allocator, alias_value);
+
+            // append remaining arguments
+            for (node.children[1..]) |arg_node| {
+                try new_cmd.append(shell.allocator, ' ');
+                try new_cmd.appendSlice(shell.allocator, arg_node.value);
+            }
+
+            // recursively execute the expanded command
+            return shell.executeCommand(new_cmd.items);
         }
-
-        // recursively execute the expanded command
-        return shell.executeCommand(new_cmd.items);
+        // for self-referencing aliases, we'll add the extra args below
     }
+
+    // get extra args from self-referencing alias (e.g., "--color=auto" from "ls --color=auto")
+    const alias_extra_args = if (shell.aliases.get(cmd_name)) |alias_value| blk: {
+        const first_word_end = std.mem.indexOfScalar(u8, alias_value, ' ') orelse alias_value.len;
+        const first_word = alias_value[0..first_word_end];
+        if (std.mem.eql(u8, first_word, cmd_name) and first_word_end < alias_value.len) {
+            break :blk alias_value[first_word_end + 1 ..]; // args after first space
+        }
+        break :blk @as([]const u8, "");
+    } else "";
 
     // expand glob patterns in arguments
     var expanded_args = try std.ArrayList([]const u8).initCapacity(shell.allocator, 16);
@@ -61,6 +207,16 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, cmd_name));
+
+    // insert alias extra args (e.g., "--color=auto")
+    if (alias_extra_args.len > 0) {
+        var iter = std.mem.splitScalar(u8, alias_extra_args, ' ');
+        while (iter.next()) |arg| {
+            if (arg.len > 0) {
+                try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, arg));
+            }
+        }
+    }
 
     for (node.children[1..]) |arg_node| {
         const arg = arg_node.value;
@@ -72,16 +228,20 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             try shell.expandVariables(arg);
         defer shell.allocator.free(var_expanded);
 
-        // Then expand globs
-        const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
-        defer glob.freeGlobResults(shell.allocator, glob_results);
+        // Then expand globs (only if pattern contains glob chars)
+        if (glob.hasGlobChars(var_expanded)) {
+            const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
+            defer glob.freeGlobResults(shell.allocator, glob_results);
 
-        if (glob_results.len == 0) {
-            try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
-        } else {
-            for (glob_results) |match| {
-                try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, match));
+            if (glob_results.len == 0) {
+                try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
+            } else {
+                for (glob_results) |match| {
+                    try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, match));
+                }
             }
+        } else {
+            try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
         }
     }
 
@@ -744,7 +904,8 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
         defer file.close();
         try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, ">>")) {
-        const file = try std.fs.cwd().openFile(expanded_target, .{ .mode = .write_only });
+        // create file if doesn't exist, don't truncate if exists
+        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = false });
         defer file.close();
         try file.seekFromEnd(0);
         try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
@@ -758,6 +919,19 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
         try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "2>&1")) {
         try std.posix.dup2(std.posix.STDOUT_FILENO, std.posix.STDERR_FILENO);
+    } else if (std.mem.eql(u8, redirect_type, "<<<")) {
+        // here string: create pipe, write string, connect to stdin
+        const pipe_fds = try std.posix.pipe();
+        defer std.posix.close(pipe_fds[0]);
+
+        // write string to write end of pipe
+        const content_with_newline = try std.fmt.allocPrint(shell.allocator, "{s}\n", .{expanded_target});
+        defer shell.allocator.free(content_with_newline);
+        _ = try std.posix.write(pipe_fds[1], content_with_newline);
+        std.posix.close(pipe_fds[1]);
+
+        // connect read end to stdin
+        try std.posix.dup2(pipe_fds[0], std.posix.STDIN_FILENO);
     }
 
     return evaluateAst(shell, command);
@@ -780,18 +954,54 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     const name = node.children[0].value;
     const value = node.children[1].value;
 
+    // Fast path for pure arithmetic assignments like i=$((i+1))
+    if (value.len >= 5 and std.mem.startsWith(u8, value, "$((") and value[value.len - 2] == ')' and value[value.len - 1] == ')') {
+        const expr = value[3 .. value.len - 2];
+        const arith_result = shell.evaluateArithmetic(expr) catch 0;
+
+        // Format result into stack buffer
+        var result_buf: [32]u8 = undefined;
+        const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{arith_result}) catch return 1;
+
+        // Try to update existing variable in-place, reusing buffer if possible
+        if (shell.variables.getPtr(name)) |value_ptr| {
+            const old_value = value_ptr.*;
+            // Reuse existing buffer if it can hold the new value (avoid alloc/free)
+            if (result_str.len <= old_value.len) {
+                // Copy into existing buffer - this is a u8 slice, need to cast for write
+                const writable: [*]u8 = @ptrCast(@constCast(old_value.ptr));
+                @memcpy(writable[0..result_str.len], result_str);
+                // Update slice length by replacing with trimmed slice
+                value_ptr.* = writable[0..result_str.len];
+            } else {
+                // Need larger buffer - free and allocate
+                shell.allocator.free(old_value);
+                value_ptr.* = try shell.allocator.dupe(u8, result_str);
+            }
+            return 0;
+        }
+
+        // New variable - need to allocate name and value
+        const name_copy = try shell.allocator.dupe(u8, name);
+        const value_copy = try shell.allocator.dupe(u8, result_str);
+        try shell.variables.put(name_copy, value_copy);
+        return 0;
+    }
+
     // expand value BEFORE removing old variable (in case value references the variable being assigned)
     const expanded_value = try shell.expandVariables(value);
     defer shell.allocator.free(expanded_value);
-    const value_copy = try shell.allocator.dupe(u8, expanded_value);
 
-    // now remove old variable after expansion is complete
-    if (shell.variables.fetchRemove(name)) |kv| {
-        shell.allocator.free(kv.key);
-        shell.allocator.free(kv.value);
+    // Try to update existing variable in-place (reuse key)
+    if (shell.variables.getPtr(name)) |value_ptr| {
+        shell.allocator.free(value_ptr.*);
+        value_ptr.* = try shell.allocator.dupe(u8, expanded_value);
+        return 0;
     }
 
+    // New variable - allocate name and value
     const name_copy = try shell.allocator.dupe(u8, name);
+    const value_copy = try shell.allocator.dupe(u8, expanded_value);
     try shell.variables.put(name_copy, value_copy);
     return 0;
 }
@@ -921,6 +1131,42 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
 pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
     return evaluateAst(shell, node.children[0]);
+}
+
+pub fn evaluateCase(shell: *Shell, node: *const ast.AstNode) !u8 {
+    // case structure: children[0] = expr, children[1..] = case_items
+    if (node.children.len < 1) return 1;
+
+    // expand the expression being matched
+    const expr_value = try shell.expandVariables(node.children[0].value);
+    defer shell.allocator.free(expr_value);
+
+    // iterate through case items (children[1..])
+    for (node.children[1..]) |case_item| {
+        if (case_item.node_type != .case_item) continue;
+
+        // patterns are stored in case_item.value, separated by '|'
+        const patterns = case_item.value;
+        var pattern_iter = std.mem.splitScalar(u8, patterns, '|');
+
+        while (pattern_iter.next()) |pattern| {
+            // expand variables in pattern
+            const expanded_pattern = try shell.expandVariables(pattern);
+            defer shell.allocator.free(expanded_pattern);
+
+            // check if pattern matches
+            if (glob.matchGlob(expanded_pattern, expr_value)) {
+                // execute the body (case_item.children[0])
+                if (case_item.children.len > 0) {
+                    return evaluateAst(shell, case_item.children[0]);
+                }
+                return 0;
+            }
+        }
+    }
+
+    // no pattern matched
+    return 0;
 }
 
 pub fn evaluateTest(shell: *Shell, node: *const ast.AstNode) !u8 {

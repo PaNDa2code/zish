@@ -62,7 +62,7 @@ Describe 'zish basic functionality'
     It 'handles stderr redirection 2>&1'
       When call zish "ls nonexistent 2>&1"
       The status should not eq 0
-      The stderr should include "nonexistent"
+      The output should include "nonexistent"
     End
   End
 

@@ -16,6 +16,7 @@ pub const NodeType = enum {
     until_loop,
     for_loop,
     case_statement,
+    case_item,  // pattern) body;;
     function_def,
     assignment,
     redirect, // >, >>, <, 2>, 2>&1

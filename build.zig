@@ -58,17 +58,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Editor demo executable
-    const editor_demo = b.addExecutable(.{
-        .name = "editor_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/editor_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(editor_demo);
-
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);

@@ -118,7 +118,7 @@ pub const Parser = struct {
 
             // stop at control structure closing keywords
             switch (self.current_token.ty) {
-                .Done, .Fi, .Else, .Elif, .Esac, .Then, .RightBrace, .RightParen => break,
+                .Done, .Fi, .Else, .Elif, .Esac, .Then, .RightBrace, .RightParen, .DoubleSemi => break,
                 else => {},
             }
 
@@ -363,6 +363,14 @@ pub const Parser = struct {
             const column = self.current_token.column;
             try self.nextToken(); // consume redirect token
 
+            // 2>&1 doesn't need a target - it redirects stderr to stdout
+            if (std.mem.eql(u8, redirect_type, "2>&1")) {
+                // create dummy target node for consistency
+                const target = try self.builder.createword("", line, column);
+                cmd = try self.builder.createredirect(cmd, redirect_type, target, line, column);
+                continue;
+            }
+
             // parse target (filename or fd)
             const target = try self.parseword();
 
@@ -560,7 +568,6 @@ pub const Parser = struct {
     }
 
     fn parsecase(self: *Self) parsererror!*const ast.AstNode {
-        // simplified case parsing - full implementation would be more complex
         const case_token = self.current_token;
         try self.nextToken(); // consume 'case'
 
@@ -571,9 +578,27 @@ pub const Parser = struct {
         }
         try self.nextToken(); // consume 'in'
 
-        // for now, just consume until esac
-        while (self.current_token.ty != .Esac and self.current_token.ty != .Eof) {
+        // skip newlines after 'in'
+        while (self.current_token.ty == .NewLine) {
             try self.nextToken();
+        }
+
+        // collect case items: [expr, item1, item2, ...]
+        var children = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 32);
+        try children.append(self.builder.arena.allocator(), expr);
+
+        // parse case items until esac
+        while (self.current_token.ty != .Esac and self.current_token.ty != .Eof) {
+            // skip whitespace/newlines between items
+            while (self.current_token.ty == .NewLine or self.current_token.ty == .Semicolon) {
+                try self.nextToken();
+            }
+
+            if (self.current_token.ty == .Esac) break;
+
+            // parse case item
+            const item = try self.parsecaseitem();
+            try children.append(self.builder.arena.allocator(), item);
         }
 
         if (self.current_token.ty != .Esac) {
@@ -584,9 +609,66 @@ pub const Parser = struct {
         return self.builder.createnode(
             .case_statement,
             "",
-            &[_]*const ast.AstNode{expr},
+            children.items,
             case_token.line,
             case_token.column,
+        );
+    }
+
+    fn parsecaseitem(self: *Self) parsererror!*const ast.AstNode {
+        const item_token = self.current_token;
+        const allocator = self.builder.arena.allocator();
+
+        // optional leading '('
+        if (self.current_token.ty == .LeftParen) {
+            try self.nextToken();
+        }
+
+        // parse pattern(s) separated by '|'
+        var pattern_buf = try std.ArrayList(u8).initCapacity(allocator, 64);
+
+        // first pattern
+        if (self.current_token.ty != .Word and self.current_token.ty != .String and
+            self.current_token.ty != .DoubleQuotedString and self.current_token.ty != .ParameterExpansion)
+        {
+            return error.UnexpectedToken;
+        }
+        try pattern_buf.appendSlice(allocator, self.current_token.value);
+        try self.nextToken();
+
+        // additional patterns separated by '|'
+        while (self.current_token.ty == .Pipe) {
+            try self.nextToken(); // consume '|'
+            try pattern_buf.append(allocator, '|');
+            if (self.current_token.ty != .Word and self.current_token.ty != .String and
+                self.current_token.ty != .DoubleQuotedString and self.current_token.ty != .ParameterExpansion)
+            {
+                return error.UnexpectedToken;
+            }
+            try pattern_buf.appendSlice(allocator, self.current_token.value);
+            try self.nextToken();
+        }
+
+        // expect ')' after pattern
+        if (self.current_token.ty != .RightParen) {
+            return error.UnexpectedToken;
+        }
+        try self.nextToken(); // consume ')'
+
+        // parse body (command list until ';;' or 'esac')
+        const body = try self.parsecommandlist();
+
+        // expect ';;' to terminate case item (optional before esac)
+        if (self.current_token.ty == .DoubleSemi) {
+            try self.nextToken(); // consume ';;'
+        }
+
+        return self.builder.createnode(
+            .case_item,
+            pattern_buf.items,
+            &[_]*const ast.AstNode{body},
+            item_token.line,
+            item_token.column,
         );
     }
 

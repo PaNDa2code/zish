@@ -597,6 +597,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             self.terminal_cursor_row = 0;
             // clear and render new prompt
             self.clearCommand();
+            self.paste_mode = false;
             self.history_index = -1;
             self.history_search_prefix_len = 0;
             self.vi.mode = .insert;
@@ -1294,7 +1295,8 @@ fn escapeSequenceAction() !Action {
     }
 
     // Need at least 2 bytes for a valid escape sequence
-    if (bytes_read < 2) return .none;
+    // If incomplete, treat as just ESC (vim normal mode)
+    if (bytes_read < 2) return .{ .vim_mode = .{ .set_mode = .normal } };
 
     const cmd_byte = temp_buf[1];
 

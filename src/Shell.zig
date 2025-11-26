@@ -2015,11 +2015,44 @@ fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
     // Execute a command and capture its output
     const trimmed_cmd = std.mem.trim(u8, command, " \t\n\r");
 
-    // Only handle simple built-ins that don't need pipelines
-    if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
-        var buf: [4096]u8 = undefined;
-        const cwd = std.posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
-        return self.allocator.dupe(u8, cwd);
+    // Fast path for simple built-ins (no pipes/redirects)
+    if (std.mem.indexOfAny(u8, trimmed_cmd, "|<>&;") == null) {
+        // pwd builtin
+        if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
+            var buf: [4096]u8 = undefined;
+            const cwd = std.posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
+            return self.allocator.dupe(u8, cwd);
+        }
+
+        // echo builtin - very common in command substitution
+        if (std.mem.startsWith(u8, trimmed_cmd, "echo ") or std.mem.eql(u8, trimmed_cmd, "echo")) {
+            const args = if (trimmed_cmd.len > 5) trimmed_cmd[5..] else "";
+            // Handle -n flag
+            if (std.mem.startsWith(u8, args, "-n ")) {
+                return self.allocator.dupe(u8, args[3..]);
+            } else if (std.mem.eql(u8, args, "-n")) {
+                return self.allocator.dupe(u8, "");
+            }
+            // Normal echo - just return args with newline (no expansion needed for simple case)
+            var result = try std.ArrayList(u8).initCapacity(self.allocator, args.len + 1);
+            try result.appendSlice(self.allocator, args);
+            try result.append(self.allocator, '\n');
+            return result.toOwnedSlice(self.allocator);
+        }
+
+        // printf builtin - simple version
+        if (std.mem.startsWith(u8, trimmed_cmd, "printf ")) {
+            const args = trimmed_cmd[7..];
+            return self.allocator.dupe(u8, args);
+        }
+
+        // true/false
+        if (std.mem.eql(u8, trimmed_cmd, "true") or std.mem.eql(u8, trimmed_cmd, ":")) {
+            return self.allocator.dupe(u8, "");
+        }
+        if (std.mem.eql(u8, trimmed_cmd, "false")) {
+            return self.allocator.dupe(u8, "");
+        }
     }
 
     // For all other commands (including pipelines), execute via shell

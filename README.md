@@ -16,6 +16,19 @@ fast, opinionated shell written in zig. for the brave.
 - `$(cmd)` and `$((math))`
 - builtins: `cd`, `-`, `..`, `...`, `local`, `export`
 
+## performance
+
+benchmarks on linux (hyperfine):
+
+| test | zish | bash | zsh |
+|------|------|------|-----|
+| `-c exit` | 240µs | 850µs | 900µs |
+| `for i in 1..10; do true; done` | 240µs | 850µs | 870µs |
+| `while [ $i -lt 1000 ]; do i=$((i+1)); done` | 2.5ms | 2.5ms | 2.8ms |
+| `fn() { echo $1; }; fn x; fn y` | 200µs | 850µs | 950µs |
+| `a=$((1+2*3))` | 210µs | 760µs | 850µs |
+| `echo x \| cat \| cat` | 1.8ms | 1.7ms | 2.1ms |
+
 ## build
 
 ```

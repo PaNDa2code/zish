@@ -63,6 +63,45 @@ pub const AstNode = struct {
     pub fn childcount(self: *const AstNode) usize {
         return self.children.len;
     }
+
+    // Deep clone AST node into a different allocator (for persistent storage)
+    pub fn clone(self: *const AstNode, allocator: std.mem.Allocator) !*AstNode {
+        // Clone value
+        const value_copy = try allocator.dupe(u8, self.value);
+        errdefer allocator.free(value_copy);
+
+        // Clone children recursively
+        const children_copy = try allocator.alloc(*const AstNode, self.children.len);
+        errdefer allocator.free(children_copy);
+
+        for (self.children, 0..) |child, i| {
+            children_copy[i] = try child.clone(allocator);
+        }
+
+        // Create new node
+        const node = try allocator.create(AstNode);
+        node.* = .{
+            .node_type = self.node_type,
+            .value = value_copy,
+            .children = children_copy,
+            .line = self.line,
+            .column = self.column,
+        };
+        return node;
+    }
+
+    // Free a cloned AST node and all its children
+    pub fn destroy(self: *const AstNode, allocator: std.mem.Allocator) void {
+        // Free children first (recursively)
+        for (self.children) |child| {
+            child.destroy(allocator);
+        }
+        allocator.free(self.children);
+        allocator.free(self.value);
+        // Cast away const to free (safe because we allocated this)
+        const mutable_self: *AstNode = @constCast(self);
+        allocator.destroy(mutable_self);
+    }
 };
 
 // typestate-based ast builder with security guarantees

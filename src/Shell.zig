@@ -59,8 +59,10 @@ history_search_prefix_len: usize,
 original_termios: ?std.posix.termios = null,
 aliases: std.StringHashMap([]const u8),
 variables: std.StringHashMap([]const u8),
-functions: std.StringHashMap([]const u8), // name -> body source
+functions: std.StringHashMap(*const ast.AstNode), // name -> body AST
 last_exit_code: u8 = 0,
+// when true, external commands exec directly instead of fork+exec (for pipeline children)
+in_pipeline: bool = false,
 
 // new modular editor
 edit_buf: editor.EditBuffer = .{},
@@ -146,7 +148,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .original_termios = null,
         .aliases = std.StringHashMap([]const u8).init(allocator),
         .variables = std.StringHashMap([]const u8).init(allocator),
-        .functions = std.StringHashMap([]const u8).init(allocator),
+        .functions = std.StringHashMap(*const ast.AstNode).init(allocator),
         // new modular editor
         .edit_buf = .{},
         .term_view = editor.TermView.init(std.posix.STDOUT_FILENO),
@@ -209,7 +211,7 @@ pub fn deinit(self: *Shell) void {
     var fn_it = self.functions.iterator();
     while (fn_it.next()) |entry| {
         self.allocator.free(entry.key_ptr.*);
-        self.allocator.free(entry.value_ptr.*);
+        entry.value_ptr.*.destroy(self.allocator); // free AST
     }
     self.functions.deinit();
 
@@ -1593,10 +1595,14 @@ fn loadAliases(self: *Shell) !void {
             }
 
             if (brace_depth == 0) {
-                // function ended, store it
+                // function ended, parse and store AST
+                var p = try parser.Parser.init(func_body.items, self.allocator);
+                defer p.deinit();
+                const body_ast = try p.parse();
+                // Clone AST for persistent storage
+                const cloned_ast = try body_ast.clone(self.allocator);
                 const name_copy = try self.allocator.dupe(u8, func_name);
-                const body_copy = try self.allocator.dupe(u8, func_body.items);
-                try self.functions.put(name_copy, body_copy);
+                try self.functions.put(name_copy, cloned_ast);
                 in_function = false;
                 func_body.clearRetainingCapacity();
             } else {
@@ -1628,9 +1634,13 @@ fn loadAliases(self: *Shell) !void {
                     if (c == '}') brace_depth -= 1;
                 }
                 if (brace_depth == 0) {
+                    // Parse and store AST
+                    var p = try parser.Parser.init(func_body.items, self.allocator);
+                    defer p.deinit();
+                    const body_ast = try p.parse();
+                    const cloned_ast = try body_ast.clone(self.allocator);
                     const name_copy = try self.allocator.dupe(u8, func_name);
-                    const body_copy = try self.allocator.dupe(u8, func_body.items);
-                    try self.functions.put(name_copy, body_copy);
+                    try self.functions.put(name_copy, cloned_ast);
                     in_function = false;
                     func_body.clearRetainingCapacity();
                 }

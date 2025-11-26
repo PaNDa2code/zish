@@ -152,8 +152,17 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
 pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
 
-    // Fast path for test builtin - avoid allocations in tight loops
     const raw_cmd = node.children[0].value;
+
+    // Fast path for simple builtins - no allocation needed
+    if (raw_cmd.len <= 8 and node.children.len == 1) {
+        if (std.mem.eql(u8, raw_cmd, "true") or (raw_cmd.len == 1 and raw_cmd[0] == ':')) return 0;
+        if (std.mem.eql(u8, raw_cmd, "false")) return 1;
+        if (std.mem.eql(u8, raw_cmd, "continue")) return 253;
+        if (std.mem.eql(u8, raw_cmd, "break")) return 254;
+    }
+
+    // Fast path for test builtin - avoid allocations in tight loops
     if ((raw_cmd.len == 1 and raw_cmd[0] == '[') or std.mem.eql(u8, raw_cmd, "test")) {
         return evaluateTestBuiltinFast(shell, node);
     }
@@ -200,20 +209,21 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     } else "";
 
     // expand glob patterns in arguments
-    var expanded_args = try std.ArrayList([]const u8).initCapacity(shell.allocator, 16);
+    // IMPORTANT: use dupeZ to create null-terminated strings for execvpeZ
+    var expanded_args = try std.ArrayList([:0]const u8).initCapacity(shell.allocator, 16);
     defer {
         for (expanded_args.items) |arg| shell.allocator.free(arg);
         expanded_args.deinit(shell.allocator);
     }
 
-    try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, cmd_name));
+    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, cmd_name));
 
     // insert alias extra args (e.g., "--color=auto")
     if (alias_extra_args.len > 0) {
         var iter = std.mem.splitScalar(u8, alias_extra_args, ' ');
         while (iter.next()) |arg| {
             if (arg.len > 0) {
-                try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, arg));
+                try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, arg));
             }
         }
     }
@@ -234,14 +244,14 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             defer glob.freeGlobResults(shell.allocator, glob_results);
 
             if (glob_results.len == 0) {
-                try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
+                try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
             } else {
                 for (glob_results) |match| {
-                    try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, match));
+                    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
                 }
             }
         } else {
-            try expanded_args.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
+            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
         }
     }
 
@@ -714,27 +724,34 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (shell.lookupCommand(cmd_name)) |full_path| {
         // free original and replace with duped cached path
         shell.allocator.free(expanded_args.items[0]);
-        expanded_args.items[0] = shell.allocator.dupe(u8, full_path) catch cmd_name;
+        expanded_args.items[0] = shell.allocator.dupeZ(u8, full_path) catch return 1;
     }
 
-    // direct fork/exec for performance
+    // build null-terminated argv on stack
+    // expanded_args contains [:0]const u8 (null-terminated slices)
+    var argv_buf: [256]?[*:0]const u8 = undefined;
+    for (expanded_args.items, 0..) |arg, i| {
+        argv_buf[i] = arg.ptr;
+    }
+    argv_buf[expanded_args.items.len] = null;
+    const argv = argv_buf[0..expanded_args.items.len :null];
+
+    // In pipeline context, exec directly (we're already forked)
+    if (shell.in_pipeline) {
+        std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {
+            std.posix.exit(127);
+        };
+        unreachable;
+    }
+
+    // Normal context: fork/exec for external command
     const pid = std.posix.fork() catch {
         try shell.stdout().print("zish: fork failed\n", .{});
         return 1;
     };
 
     if (pid == 0) {
-        // child process - exec the command
-        // build null-terminated argv on stack
-        var argv_buf: [256]?[*:0]const u8 = undefined;
-        for (expanded_args.items, 0..) |arg, i| {
-            argv_buf[i] = @ptrCast(arg.ptr);
-        }
-        argv_buf[expanded_args.items.len] = null;
-        const argv = argv_buf[0..expanded_args.items.len :null];
-
         std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {
-            // exec failed - exit (parent will report error)
             std.posix.exit(127);
         };
     }
@@ -763,12 +780,78 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     return 127;
 }
 
+// Check if command name is a builtin
+fn isBuiltin(name: []const u8) bool {
+    const builtins = [_][]const u8{
+        "echo", "cd", "pwd", "exit", "export", "unset", "alias", "unalias",
+        "source", ".", "history", "type", "which", "set", "true", "false",
+        ":", "test", "[", "read", "printf", "break", "continue", "return",
+        "shift", "local", "declare", "readonly", "jobs", "fg", "bg", "kill",
+        "wait", "trap", "eval", "exec", "builtin", "command", "hash", "help",
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+// Check if any argument needs variable/glob expansion
+fn needsExpansion(node: *const ast.AstNode) bool {
+    for (node.children) |child| {
+        for (child.value) |c| {
+            if (c == '$' or c == '`' or c == '*' or c == '?' or c == '[' or c == '~') return true;
+        }
+    }
+    return false;
+}
+
+// Exec a simple command directly (no variable expansion needed)
+fn execSimpleCommand(shell: *Shell, node: *const ast.AstNode) void {
+    var argv_buf: [256]?[*:0]const u8 = undefined;
+    var arg_count: usize = 0;
+
+    // First arg might need path lookup
+    const cmd_name = node.children[0].value;
+    if (shell.lookupCommand(cmd_name)) |full_path| {
+        argv_buf[0] = @ptrCast(full_path.ptr);
+    } else {
+        argv_buf[0] = @ptrCast(cmd_name.ptr);
+    }
+    arg_count = 1;
+
+    // Rest of args as-is
+    for (node.children[1..]) |child| {
+        if (arg_count >= 255) break;
+        argv_buf[arg_count] = @ptrCast(child.value.ptr);
+        arg_count += 1;
+    }
+    argv_buf[arg_count] = null;
+
+    const argv = argv_buf[0..arg_count :null];
+    std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {};
+    std.posix.exit(127);
+}
+
 pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len < 2) return 1;
 
     const num_commands = node.children.len;
-    const pipes = try shell.allocator.alloc([2]std.posix.fd_t, num_commands - 1);
-    defer shell.allocator.free(pipes);
+
+    // Use stack allocation for small pipelines (up to 8 commands)
+    var stack_pipes: [7][2]std.posix.fd_t = undefined;
+    var stack_pids: [8]std.posix.pid_t = undefined;
+
+    const pipes = if (num_commands <= 8)
+        stack_pipes[0 .. num_commands - 1]
+    else
+        try shell.allocator.alloc([2]std.posix.fd_t, num_commands - 1);
+    defer if (num_commands > 8) shell.allocator.free(pipes);
+
+    const pids = if (num_commands <= 8)
+        stack_pids[0..num_commands]
+    else
+        try shell.allocator.alloc(std.posix.pid_t, num_commands);
+    defer if (num_commands > 8) shell.allocator.free(pids);
 
     // initialize to invalid fd for safe cleanup on error
     for (pipes) |*pipe_fds| {
@@ -779,9 +862,6 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     for (pipes) |*pipe_fds| {
         pipe_fds.* = try std.posix.pipe();
     }
-
-    var pids = try shell.allocator.alloc(std.posix.pid_t, num_commands);
-    defer shell.allocator.free(pids);
 
     // initialize pids to 0 so we can track which children were forked
     for (pids) |*pid| {
@@ -806,6 +886,7 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     for (node.children, 0..) |child, i| {
         const pid = try std.posix.fork();
         if (pid == 0) {
+            // Setup pipes first
             if (i > 0) {
                 try std.posix.dup2(pipes[i - 1][0], std.posix.STDIN_FILENO);
             }
@@ -816,6 +897,19 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
                 std.posix.close(pipe_fds[0]);
                 std.posix.close(pipe_fds[1]);
             }
+
+            // Fast path: simple external command - exec directly without evaluateAst
+            if (child.node_type == .command and child.children.len > 0) {
+                const cmd_name = child.children[0].value;
+                // Check if it's a simple external command (not a builtin, no special chars)
+                if (!isBuiltin(cmd_name) and !needsExpansion(child)) {
+                    execSimpleCommand(shell, child);
+                    // execSimpleCommand doesn't return on success
+                }
+            }
+
+            // Full path for builtins, complex commands, etc.
+            shell.in_pipeline = true;
             const status = evaluateAst(shell, child) catch 127;
             shell.stdout().flush() catch {};
             std.process.exit(status);
@@ -1089,43 +1183,93 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
     var should_break = false;
 
     outer: for (values) |value_node| {
-        const var_expanded = if (value_node.node_type == .string)
-            try shell.allocator.dupe(u8, value_node.value)
-        else
-            try shell.expandVariables(value_node.value);
-        defer shell.allocator.free(var_expanded);
+        // Fast path: if no variables or globs, use the value directly
+        const raw_value = value_node.value;
+        const needs_expansion = value_node.node_type != .string and
+            std.mem.indexOfScalar(u8, raw_value, '$') != null;
+        const has_glob = glob.hasGlobChars(raw_value);
 
-        const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
-        defer glob.freeGlobResults(shell.allocator, glob_results);
-
-        const items_to_iterate = if (glob_results.len == 0)
-            &[_][]const u8{var_expanded}
-        else
-            glob_results;
-
-        for (items_to_iterate) |item| {
-            if (shell.variables.fetchRemove(variable.value)) |kv| {
-                shell.allocator.free(kv.key);
-                shell.allocator.free(kv.value);
-            }
-
-            const name_copy = try shell.allocator.dupe(u8, variable.value);
-            const value_copy = try shell.allocator.dupe(u8, item);
-            try shell.variables.put(name_copy, value_copy);
-
+        if (!needs_expansion and !has_glob) {
+            // Direct iteration - no allocations needed for the value itself
+            try setForVariable(shell, variable.value, raw_value);
             last_status = try evaluateAst(shell, body);
-            if (last_status == 254) { // break
+            if (last_status == 254) {
                 should_break = true;
                 break :outer;
             }
-            if (last_status == 253) { // continue
+            if (last_status == 253) {
                 last_status = 0;
-                continue;
+            }
+            continue;
+        }
+
+        // Slow path: need to expand variables or globs
+        const var_expanded = if (value_node.node_type == .string)
+            try shell.allocator.dupe(u8, raw_value)
+        else
+            try shell.expandVariables(raw_value);
+        defer shell.allocator.free(var_expanded);
+
+        // Only expand globs if pattern contains glob chars
+        if (has_glob) {
+            const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
+            defer glob.freeGlobResults(shell.allocator, glob_results);
+
+            const items = if (glob_results.len == 0)
+                &[_][]const u8{var_expanded}
+            else
+                glob_results;
+
+            for (items) |item| {
+                try setForVariable(shell, variable.value, item);
+                last_status = try evaluateAst(shell, body);
+                if (last_status == 254) {
+                    should_break = true;
+                    break :outer;
+                }
+                if (last_status == 253) {
+                    last_status = 0;
+                    continue;
+                }
+            }
+        } else {
+            // No glob, just use expanded value
+            try setForVariable(shell, variable.value, var_expanded);
+            last_status = try evaluateAst(shell, body);
+            if (last_status == 254) {
+                should_break = true;
+                break :outer;
+            }
+            if (last_status == 253) {
+                last_status = 0;
             }
         }
     }
 
     return if (should_break) 0 else last_status;
+}
+
+// Helper for for-loop variable assignment - reuses existing storage when possible
+fn setForVariable(shell: *Shell, name: []const u8, value: []const u8) !void {
+    // Try to update existing variable in-place
+    if (shell.variables.getPtr(name)) |value_ptr| {
+        const old_value = value_ptr.*;
+        // Reuse buffer if it fits
+        if (value.len <= old_value.len) {
+            const writable: [*]u8 = @ptrCast(@constCast(old_value.ptr));
+            @memcpy(writable[0..value.len], value);
+            value_ptr.* = writable[0..value.len];
+        } else {
+            shell.allocator.free(old_value);
+            value_ptr.* = try shell.allocator.dupe(u8, value);
+        }
+        return;
+    }
+
+    // New variable
+    const name_copy = try shell.allocator.dupe(u8, name);
+    const value_copy = try shell.allocator.dupe(u8, value);
+    try shell.variables.put(name_copy, value_copy);
 }
 
 pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
@@ -1330,21 +1474,18 @@ pub fn evaluateFunctionDef(shell: *Shell, node: *const ast.AstNode) !u8 {
     const func_name = node.value;
     const body = node.children[0];
 
-    // serialize body to string (simple approach - just value for now)
-    var body_buf = std.ArrayListUnmanaged(u8){};
-    defer body_buf.deinit(shell.allocator);
-
-    try serializeAst(shell.allocator, &body_buf, body);
+    // Clone AST into shell's allocator for persistent storage
+    const body_clone = try body.clone(shell.allocator);
+    errdefer body_clone.destroy(shell.allocator);
 
     // store function
     const name_copy = try shell.allocator.dupe(u8, func_name);
     errdefer shell.allocator.free(name_copy);
-    const body_copy = try body_buf.toOwnedSlice(shell.allocator);
 
-    if (try shell.functions.fetchPut(name_copy, body_copy)) |old| {
+    if (try shell.functions.fetchPut(name_copy, body_clone)) |old| {
         // free old value but not key (fetchPut reuses key slot)
         shell.allocator.free(name_copy); // we don't need the new key copy
-        shell.allocator.free(old.value);
+        old.value.destroy(shell.allocator); // free old AST
     }
 
     return 0;
@@ -1405,8 +1546,8 @@ pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !
         try setShellVar(shell, num_str, arg);
     }
 
-    // execute function body
-    const result = shell.executeCommand(body) catch |err| {
+    // execute function body directly from stored AST (no re-parsing!)
+    const result = evaluateAst(shell, body) catch |err| {
         // clear positional parameters
         for (args, 1..) |_, i| {
             var num_buf: [16]u8 = undefined;

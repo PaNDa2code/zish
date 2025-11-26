@@ -588,17 +588,19 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .cancel => {
             completion_mod.exitCompletionMode(self);
+            // print ^C like bash does
+            try self.stdout().writeAll("^C\n");
+            // signal we're on a fresh line
+            self.term_view.finishLine();
+            self.displayed_cmd_lines = 1;
+            self.terminal_cursor_row = 0;
+            // clear and render new prompt
             self.clearCommand();
             self.history_index = -1;
             self.history_search_prefix_len = 0;
             self.vi.mode = .insert;
             self.vim_mode = .insert; // legacy compat
-            // render clears old content using rows_owned, then updates to new size
             try self.renderLine();
-            // now signal we're on a fresh line
-            self.term_view.finishLine();
-            self.displayed_cmd_lines = 1;
-            self.terminal_cursor_row = 0;
             try self.setCursorStyle(.bar);
         },
 
@@ -727,6 +729,9 @@ fn handleAction(self: *Shell, action: Action) !void {
                         h.addCommand(command, self.last_exit_code) catch {};
                     }
                 }
+
+                // flush any command output before rendering new prompt
+                try self.stdout().flush();
 
                 self.clearCommand();
                 self.history_index = -1;

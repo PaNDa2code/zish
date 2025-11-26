@@ -58,7 +58,7 @@ hyperfine --warmup 3 -N \
 echo ""
 echo "7. FOR LOOP WITH FUNCTION CALLS"
 hyperfine --warmup 3 -N \
-  "$ZISH -c 'double() { echo \$((\\$1 * 2)); }; for i in 1 2 3 4 5; do double \$i; done'" \
+  "$ZISH -c 'double() { echo \$((\$1 * 2)); }; for i in 1 2 3 4 5; do double \$i; done'" \
   "bash -c 'double() { echo \$((\$1 * 2)); }; for i in 1 2 3 4 5; do double \$i; done'" \
   "zsh -c 'double() { echo \$((\$1 * 2)); }; for i in 1 2 3 4 5; do double \$i; done'" \
   2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'

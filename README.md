@@ -18,16 +18,19 @@ fast, opinionated shell written in zig. for the brave.
 
 ## performance
 
-benchmarks on linux (hyperfine):
+benchmarks via `./bench.sh` (hyperfine):
 
-| test | zish | bash | zsh |
-|------|------|------|-----|
-| `-c exit` | 240µs | 850µs | 900µs |
-| `for i in 1..10; do true; done` | 240µs | 850µs | 870µs |
-| `while [ $i -lt 1000 ]; do i=$((i+1)); done` | 2.5ms | 2.5ms | 2.8ms |
-| `fn() { echo $1; }; fn x; fn y` | 200µs | 850µs | 950µs |
-| `a=$((1+2*3))` | 210µs | 760µs | 850µs |
-| `echo x \| cat \| cat` | 1.8ms | 1.7ms | 2.1ms |
+| test | vs bash | vs zsh |
+|------|---------|--------|
+| variables: `x=hello; y=world; z="$x $y"; unset x` | 3.2x | 3.6x |
+| functions: `greet() { echo "Hello $1"; }; greet World` | 3.3x | 3.8x |
+| arithmetic: `a=5; b=3; c=$((a + b * 2))` | 3.5x | 3.8x |
+| conditionals: `if [ $x -gt 10 ]; then ... fi` | 3.5x | 3.9x |
+| case: `case $x in foo) echo matched;; esac` | 3.5x | 4.0x |
+| for + functions: `for i in 1 2 3 4 5; do fn $i; done` | 2.5x | 2.9x |
+| nested loops: `for i in 1 2 3; do for j in a b c; ...` | 1.9x | 2.0x |
+| pipeline: `echo "3\n1\n2" \| sort \| head -2` | 1.8x | 2.1x |
+| command substitution: `x=$(echo hello)` | 0.7x | 0.7x |
 
 ## build
 

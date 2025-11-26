@@ -13,8 +13,10 @@ const completion_mod = @import("completion.zig");
 const eval = @import("eval.zig");
 const git = @import("git.zig");
 const highlight = @import("highlight.zig");
+const editor = @import("editor.zig");
+const vim = @import("vim.zig");
 
-// Re-export from input module
+// Re-export from input module (for compatibility)
 const VimMode = input_mod.VimMode;
 const WordBoundary = input_mod.WordBoundary;
 const HistoryDirection = input_mod.HistoryDirection;
@@ -52,18 +54,20 @@ running: bool,
 history: ?*hist.History,
 vim_mode: VimMode,
 vim_mode_enabled: bool,
-cursor_pos: usize,
 history_index: i32,
 history_search_prefix_len: usize,
-current_command: []u8,
-current_command_len: usize,
 original_termios: ?std.posix.termios = null,
 aliases: std.StringHashMap([]const u8),
 variables: std.StringHashMap([]const u8),
 functions: std.StringHashMap([]const u8), // name -> body source
 last_exit_code: u8 = 0,
 
-// vim clipboard for yank/paste operations
+// new modular editor
+edit_buf: editor.EditBuffer = .{},
+term_view: editor.TermView,
+vi: vim.Vim = .{},
+
+// vim clipboard for yank/paste operations (legacy, now in vi.yank_buf)
 clipboard: []u8,
 clipboard_len: usize = 0,
 // search state
@@ -108,7 +112,6 @@ enable_highlighting: bool = true,
 
 // PATH lookup cache - maps command name -> full path
 path_cache: std.StringHashMap([]const u8),
-path_cache_version: u64 = 0, // incremented when PATH changes
 
 pub fn init(allocator: std.mem.Allocator) !*Shell {
     return initWithOptions(allocator, true);
@@ -127,8 +130,6 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
     else
         null;
 
-    // allocate buffer for current command editing
-    const cmd_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
     const clipboard_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
     const search_buffer = try allocator.alloc(u8, 256); // search queries are usually short
 
@@ -140,15 +141,16 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .history = history,
         .vim_mode = .insert,
         .vim_mode_enabled = true,
-        .cursor_pos = 0,
         .history_index = -1,
         .history_search_prefix_len = 0,
-        .current_command = cmd_buffer,
-        .current_command_len = 0,
         .original_termios = null,
         .aliases = std.StringHashMap([]const u8).init(allocator),
         .variables = std.StringHashMap([]const u8).init(allocator),
         .functions = std.StringHashMap([]const u8).init(allocator),
+        // new modular editor
+        .edit_buf = .{},
+        .term_view = editor.TermView.init(std.posix.STDOUT_FILENO),
+        .vi = .{},
         .clipboard = clipboard_buffer,
         .clipboard_len = 0,
         .search_mode = false,
@@ -231,11 +233,84 @@ pub fn deinit(self: *Shell) void {
     }
     self.path_cache.deinit();
 
-    self.allocator.free(self.current_command);
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
     self.allocator.free(self.stdout().buffer);
     self.allocator.destroy(self);
+}
+/// Get command slice (prefers edit_buf)
+fn getCommand(self: *Shell) []const u8 {
+    return self.edit_buf.slice();
+}
+
+fn clearCommand(self: *Shell) void {
+    self.edit_buf.clear();
+}
+
+/// Render using TermView
+pub fn renderLine(self: *Shell) !void {
+    var prompt_buf: [256]u8 = undefined;
+    const prompt = self.buildPrompt(&prompt_buf);
+    try self.term_view.render(&self.edit_buf, prompt.slice, prompt.visible_len);
+}
+
+const PromptInfo = struct {
+    slice: []const u8,
+    visible_len: u16,
+};
+
+fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
+    // get mode indicator
+    const mode_str = self.vi.modeIndicatorColored();
+
+    // get user
+    const user = std.process.getEnvVarOwned(self.allocator, "USER") catch "?";
+    defer if (!std.mem.eql(u8, user, "?")) self.allocator.free(user);
+
+    // get hostname
+    var hostname_buf: [64]u8 = undefined;
+    const hostname = std.posix.gethostname(&hostname_buf) catch "localhost";
+
+    // get cwd
+    var cwd_buf: [256]u8 = undefined;
+    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+
+    // simplify home path
+    const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch null;
+    defer if (home) |h| self.allocator.free(h);
+
+    var path_buf: [256]u8 = undefined;
+    const display_path = if (home) |h| blk: {
+        if (std.mem.startsWith(u8, cwd, h)) {
+            if (std.mem.eql(u8, cwd, h)) {
+                break :blk "~";
+            } else {
+                break :blk std.fmt.bufPrint(&path_buf, "~{s}", .{cwd[h.len..]}) catch cwd;
+            }
+        }
+        break :blk cwd;
+    } else cwd;
+
+    // color codes
+    const green = "\x1b[32m"; // user@host
+    const cyan = "\x1b[36m"; // path
+    const reset = "\x1b[0m";
+
+    // format: [M] user@host path $
+    const len = std.fmt.bufPrint(buf, "{s} {s}{s}@{s}{s} {s}{s}{s} $ ", .{
+        mode_str,
+        green, user, hostname, reset,
+        cyan, display_path, reset,
+    }) catch return .{ .slice = "$ ", .visible_len = 2 };
+
+    // calculate visible length (mode indicator is 3-4 chars visible)
+    const mode_visible: u16 = if (self.vi.mode == .visual_line) 4 else 3;
+    const rest_visible = @as(u16, @intCast(user.len + 1 + hostname.len + 1 + display_path.len + 3)); // @ + space + " $ "
+
+    return .{
+        .slice = buf[0..len.len],
+        .visible_len = mode_visible + 1 + rest_visible, // +1 for space after mode
+    };
 }
 
 /// Look up a command in PATH, using cache when possible
@@ -248,16 +323,21 @@ pub fn lookupCommand(self: *Shell, cmd_name: []const u8) ?[]const u8 {
     // check cache first
     if (self.path_cache.get(cmd_name)) |cached_path| {
         // verify file still exists and is executable
-        const file = std.fs.openFileAbsolute(cached_path, .{}) catch {
+        const file = if (std.fs.path.isAbsolute(cached_path))
+            std.fs.openFileAbsolute(cached_path, .{})
+        else
+            std.fs.cwd().openFile(cached_path, .{});
+        if (file) |f| {
+            f.close();
+            return cached_path;
+        } else |_| {
             // file no longer exists, remove from cache
             if (self.path_cache.fetchRemove(cmd_name)) |kv| {
                 self.allocator.free(kv.key);
                 self.allocator.free(kv.value);
             }
             return self.searchPath(cmd_name);
-        };
-        file.close();
-        return cached_path;
+        }
     }
 
     return self.searchPath(cmd_name);
@@ -274,7 +354,10 @@ fn searchPath(self: *Shell, cmd_name: []const u8) ?[]const u8 {
         const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, cmd_name }) catch continue;
 
         // check if file exists and is executable
-        const file = std.fs.openFileAbsolute(full_path, .{}) catch {
+        const file = (if (std.fs.path.isAbsolute(full_path))
+            std.fs.openFileAbsolute(full_path, .{})
+        else
+            std.fs.cwd().openFile(full_path, .{})) catch {
             self.allocator.free(full_path);
             continue;
         };
@@ -308,17 +391,6 @@ fn searchPath(self: *Shell, cmd_name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Clear PATH cache (call when PATH env var changes)
-pub fn invalidatePathCache(self: *Shell) void {
-    var it = self.path_cache.iterator();
-    while (it.next()) |entry| {
-        self.allocator.free(entry.key_ptr.*);
-        self.allocator.free(entry.value_ptr.*);
-    }
-    self.path_cache.clearRetainingCapacity();
-    self.path_cache_version +%= 1;
-}
-
 pub fn run(self: *Shell) !void {
     self.running = true;
 
@@ -340,8 +412,7 @@ pub fn run(self: *Shell) !void {
         CursorStyle.bar;
     try self.setCursorStyle(initial_cursor);
 
-    try self.printFancyPrompt();
-    try self.stdout().flush();
+    try self.renderLine();
 
     var last_action: Action = .none;
 
@@ -405,10 +476,6 @@ fn getTerminalSize(_: *Shell) TerminalSize {
     }
 
     return .{ .width = 80, .height = 24 }; // fallback if ioctl fails
-}
-
-fn getTerminalWidth(self: *Shell) usize {
-    return self.getTerminalSize().width;
 }
 
 fn handleSigwinch(_: c_int) callconv(.c) void {
@@ -476,82 +543,11 @@ fn handleResize(self: *Shell) !void {
         }
 
         // redraw with new dimensions
-        try self.displayCompletions();
+        try completion_mod.displayCompletions(self);
     } else {
         // just redraw the current line
-        try self.redrawLine();
+        try self.renderLine();
     }
-}
-
-fn printFancyPrompt(self: *Shell) !void {
-    // get current user
-    const user = std.process.getEnvVarOwned(self.allocator, "USER") catch "unknown";
-    defer if (std.mem.eql(u8, user, "unknown")) {} else self.allocator.free(user);
-
-    // get hostname
-    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    const hostname = std.posix.gethostname(&hostname_buf) catch "localhost";
-
-    // get current directory
-    var cwd_buf: [4096]u8 = undefined;
-    const full_cwd = std.posix.getcwd(&cwd_buf) catch "/";
-
-    // simplify path - show ~ for home directory
-    const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch null;
-    defer if (home) |h| self.allocator.free(h);
-
-    const display_path = if (home) |h| blk: {
-        if (std.mem.startsWith(u8, full_cwd, h)) {
-            if (std.mem.eql(u8, full_cwd, h)) {
-                break :blk "~";
-            } else {
-                // create ~/ + rest of path
-                var path_buf: [4096]u8 = undefined;
-                const rest = full_cwd[h.len..];
-                break :blk std.fmt.bufPrint(&path_buf, "~{s}", .{rest}) catch full_cwd;
-            }
-        } else {
-            break :blk full_cwd;
-        }
-    } else full_cwd;
-
-    // print colorful zsh-like prompt
-    const effective_mode = if (self.vim_mode_enabled) self.vim_mode else .insert;
-    const mode_color = switch (effective_mode) {
-        .insert => tty.Color.yellow,
-        .normal => tty.Color.red,
-    };
-    const mode_indicator = if (self.vim_mode_enabled) switch (effective_mode) {
-        .insert => "I",
-        .normal => "N",
-    } else "E"; // E for emacs/normal editing mode
-
-    // git info on separate line above prompt (if enabled)
-    if (self.show_git_info) {
-        if (git.getInfo(self.allocator)) |info| {
-            var git_info = info;
-            defer git_info.deinit(self.allocator);
-
-            const dirty_indicator: []const u8 = if (git_info.dirty) "*" else "";
-            if (git_info.commit.len > 0) {
-                try self.stdout().print("{f}{s}{f} {s}{s}\n", .{
-                    tty.Color.magenta, git_info.branch, tty.Color.reset,
-                    git_info.commit, dirty_indicator,
-                });
-            } else {
-                try self.stdout().print("{f}{s}{s}{f}\n", .{
-                    tty.Color.magenta, git_info.branch, dirty_indicator, tty.Color.reset,
-                });
-            }
-        }
-    }
-
-    // clean 80-char prompt: [mode] user@host ~/path $
-    try self.stdout().print("{f}[{f}{s}{f}] {f}{s}@{s}{f} {f}{s}{f} $ ", .{
-        tty.Style.bold,  mode_color,   mode_indicator,  tty.Color.reset,
-        Colors.userhost, user,         hostname,        tty.Color.reset,
-        Colors.path,     display_path, tty.Color.reset,
-    });
 }
 
 fn log(self: *Shell, last_action: Action) !void {
@@ -561,23 +557,22 @@ fn log(self: *Shell, last_action: Action) !void {
             buff[0..],
             "\x1b[H\x1b[J" ++
                 "State:\n" ++
-                "\tcursor_pos: {}\n" ++
+                "\tcursor: {}\n" ++
                 "\tvim_mode: {s}\n" ++
                 "\tvim_mode_enabled: {}\n" ++
                 "\thistory_index: {}\n" ++
-                "\tcurrent_command_len: {}\n" ++
-                "\tclipboard_len: {}\n" ++
+                "\tbuf_len: {}\n" ++
                 "\tsearch_mode: {}\n" ++
                 "\tsearch_len: {}\n" ++
-                "\tcurrent_command: '{s}'\n" ++
+                "\tcommand: '{s}'\n" ++
                 "\tsearch_buffer: '{s}'\n" ++
                 "\tlast_action: '{}'\n",
             .{
-                self.cursor_pos,                                   @tagName(self.vim_mode),
-                self.vim_mode_enabled,                             self.history_index,
-                self.current_command_len,                          self.clipboard_len,
-                self.search_mode,                                  self.search_len,
-                self.current_command[0..self.current_command_len], self.search_buffer[0..self.search_len],
+                self.edit_buf.cursor, @tagName(self.vim_mode),
+                self.vim_mode_enabled, self.history_index,
+                self.edit_buf.len,
+                self.search_mode, self.search_len,
+                self.edit_buf.slice(), self.search_buffer[0..self.search_len],
                 last_action,
             },
         );
@@ -590,17 +585,19 @@ fn handleAction(self: *Shell, action: Action) !void {
         .none => {},
 
         .cancel => {
-            self.exitCompletionMode();
-            self.current_command_len = 0;
-            self.cursor_pos = 0;
+            completion_mod.exitCompletionMode(self);
+            self.clearCommand();
             self.history_index = -1;
             self.history_search_prefix_len = 0;
-            self.displayed_cmd_lines = 1; // fresh prompt
+            self.vi.mode = .insert;
+            self.vim_mode = .insert; // legacy compat
+            // render clears old content using rows_owned, then updates to new size
+            try self.renderLine();
+            // now signal we're on a fresh line
+            self.term_view.finishLine();
+            self.displayed_cmd_lines = 1;
             self.terminal_cursor_row = 0;
-            self.vim_mode = .insert; // Always return to insert mode
             try self.setCursorStyle(.bar);
-            try self.stdout().writeByte('\n');
-            try self.printFancyPrompt();
         },
 
         .exit_shell => {
@@ -620,10 +617,10 @@ fn handleAction(self: *Shell, action: Action) !void {
                 try self.stdout().writeAll(if (is_now_bookmarked) " *" else " -");
                 try self.stdout().flush();
                 std.Thread.sleep(80 * std.time.ns_per_ms);
-                try self.redrawLine();
-            } else if (self.current_command_len > 0) {
+                try self.renderLine();
+            } else if (self.edit_buf.len > 0) {
                 // Bookmark current command being typed
-                const cmd = self.current_command[0..self.current_command_len];
+                const cmd = self.edit_buf.slice();
                 // Add to history and bookmark it
                 h.addCommand(cmd, 0) catch {};
                 const cmd_hash = std.hash.Wyhash.hash(0, cmd);
@@ -632,14 +629,14 @@ fn handleAction(self: *Shell, action: Action) !void {
                     try self.stdout().writeAll(" *");
                     try self.stdout().flush();
                     std.Thread.sleep(80 * std.time.ns_per_ms);
-                    try self.redrawLine();
+                    try self.renderLine();
                 }
             }
         },
 
         .input_char => |char| {
             // exit completion mode when typing
-            self.exitCompletionMode();
+            completion_mod.exitCompletionMode(self);
 
             if (self.search_mode) {
                 // Add to search buffer
@@ -649,47 +646,12 @@ fn handleAction(self: *Shell, action: Action) !void {
                     try self.stdout().writeByte(char);
                 }
             } else {
-                // Add to command buffer
-                if (self.current_command_len >= self.current_command.len)
-                    return error.InputTooLong;
-
-                // Make room for the new character if inserting in middle
-                if (self.cursor_pos < self.current_command_len) {
-                    // Shift everything right by 1, starting from the end
-                    var i = self.current_command_len;
-                    while (i > self.cursor_pos) : (i -= 1) {
-                        self.current_command[i] = self.current_command[i - 1];
-                    }
-                }
-
-                // Insert the character at cursor position
-                self.current_command[self.cursor_pos] = char;
-                self.current_command_len += 1;
-                self.cursor_pos += 1;
+                // Use new edit_buf for insertion
+                if (!self.edit_buf.insert(char)) return;
 
                 // Update display (skip during paste mode - redraw at paste end)
                 if (!self.paste_mode) {
-                    // Check if content has newlines or might wrap - use full redraw
-                    // This ensures terminal_cursor_row stays accurate
-                    const has_newlines = std.mem.indexOfScalar(u8, self.current_command[0..self.current_command_len], '\n') != null;
-                    const term_width = if (self.terminal_width > 0) self.terminal_width else 80;
-                    const prompt_len = self.calculatePromptLength();
-                    const might_wrap = (self.current_command_len + prompt_len) >= term_width;
-
-                    if (char == '\n' or has_newlines or might_wrap) {
-                        // Full redraw for multiline or wrapped content
-                        try self.redrawLine();
-                    } else if (self.cursor_pos == self.current_command_len) {
-                        // Simple case: single line, at end - just echo
-                        try self.stdout().writeByte(char);
-                    } else {
-                        // Mid-line insert on single short line
-                        try self.stdout().writeAll(self.current_command[self.cursor_pos - 1 .. self.current_command_len]);
-                        const chars_to_move_back = self.current_command_len - self.cursor_pos;
-                        if (chars_to_move_back > 0) {
-                            try self.stdout().print("\x1b[{d}D", .{chars_to_move_back});
-                        }
-                    }
+                    try self.renderLine();
                 }
             }
         },
@@ -701,15 +663,8 @@ fn handleAction(self: *Shell, action: Action) !void {
                     try self.stdout().writeAll("\x08 \x08");
                 }
             } else {
-                if (self.cursor_pos > 0 and self.current_command_len > 0) {
-                    // Delete character before cursor
-                    @memmove(
-                        self.current_command[self.cursor_pos - 1 .. self.current_command_len - 1],
-                        self.current_command[self.cursor_pos..self.current_command_len],
-                    );
-                    self.cursor_pos -= 1;
-                    self.current_command_len -= 1;
-                    try self.redrawLine();
+                if (self.edit_buf.delete()) {
+                                        try self.renderLine();
                 }
             }
         },
@@ -717,37 +672,34 @@ fn handleAction(self: *Shell, action: Action) !void {
         .delete => |delete_action| {
             switch (delete_action) {
                 .char_under_cursor => {
-                    if (self.cursor_pos < self.current_command_len) {
-                        @memmove(
-                            self.current_command[self.cursor_pos .. self.current_command_len - 1],
-                            self.current_command[self.cursor_pos + 1 .. self.current_command_len],
-                        );
-                        self.current_command_len -= 1;
-                        try self.redrawLine();
+                    if (self.edit_buf.deleteForward()) {
+                                                try self.renderLine();
                     }
                 },
                 .to_line_end => {
-                    if (self.cursor_pos < self.current_command_len) {
-                        // Copy to clipboard
-                        const delete_len = self.current_command_len - self.cursor_pos;
-                        @memcpy(
-                            self.clipboard[0..delete_len],
-                            self.current_command[self.cursor_pos..self.current_command_len],
-                        );
-                        self.clipboard_len = delete_len;
-                        // Delete
-                        self.current_command_len = self.cursor_pos;
-                        try self.redrawLine();
+                    // Delete to end of line (D in vim)
+                    const start = self.edit_buf.cursor;
+                    self.edit_buf.moveLineEnd();
+                    const end = self.edit_buf.cursor;
+                    if (end > start) {
+                        // yank to vim register
+                        const len = end - start;
+                        @memcpy(self.vi.yank_buf[0..len], self.edit_buf.text[start..end]);
+                        self.vi.yank_len = @intCast(len);
+                        // delete
+                        self.edit_buf.cursor = start;
+                        var i: usize = 0;
+                        while (i < len) : (i += 1) _ = self.edit_buf.deleteForward();
+                                                try self.renderLine();
                     }
                 },
                 .char_at => |pos| {
-                    if (pos < self.current_command_len) {
-                        @memmove(
-                            self.current_command[pos .. self.current_command_len - 1],
-                            self.current_command[pos + 1 .. self.current_command_len],
-                        );
-                        self.current_command_len -= 1;
-                        try self.redrawLine();
+                    if (pos < self.edit_buf.len) {
+                        const old_cursor = self.edit_buf.cursor;
+                        self.edit_buf.cursor = @intCast(pos);
+                        _ = self.edit_buf.deleteForward();
+                        self.edit_buf.cursor = if (old_cursor > pos) old_cursor - 1 else old_cursor;
+                                                try self.renderLine();
                     }
                 },
             }
@@ -758,9 +710,9 @@ fn handleAction(self: *Shell, action: Action) !void {
                 // In search mode, treat enter as exit search
                 try self.handleAction(.{ .exit_search_mode = true });
             } else {
-                self.exitCompletionMode();
+                completion_mod.exitCompletionMode(self);
 
-                const command = std.mem.trim(u8, self.current_command[0..self.current_command_len], " \t\n\r");
+                const command = std.mem.trim(u8, self.edit_buf.slice(), " \t\n\r");
 
                 try self.stdout().writeByte('\n');
                 try self.stdout().flush();
@@ -774,35 +726,36 @@ fn handleAction(self: *Shell, action: Action) !void {
                     }
                 }
 
-                self.current_command_len = 0;
-                self.cursor_pos = 0;
+                self.clearCommand();
                 self.history_index = -1;
                 self.history_search_prefix_len = 0;
-                self.displayed_cmd_lines = 1; // reset for new prompt
-                self.terminal_cursor_row = 0; // reset terminal cursor tracking
-                self.vim_mode = .insert;
+                self.vi.mode = .insert;
+                self.vim_mode = .insert; // legacy compat
+                self.term_view.finishLine();
+                self.displayed_cmd_lines = 1;
+                self.terminal_cursor_row = 0;
                 try self.setCursorStyle(.bar);
 
                 if (self.running)
-                    try self.printFancyPrompt();
+                    try self.renderLine();
             }
         },
 
-        .redraw_line => try self.redrawLine(),
+        .redraw_line => try self.renderLine(),
 
         .clear_screen => {
             try self.stdout().writeAll("\x1b[2J\x1b[H");
+            self.term_view.finishLine();
             self.displayed_cmd_lines = 1;
             self.terminal_cursor_row = 0;
-            // redrawLine handles prompt + content + cursor tracking
-            try self.redrawLine();
+            try self.renderLine();
         },
 
         .vim_mode => |mode_action| {
             switch (mode_action) {
                 .set_mode => |mode| {
                     self.vim_mode = mode;
-                    // entering normal mode should exit paste mode
+                    self.vi.mode = if (mode == .normal) .normal else .insert;
                     if (mode == .normal) self.paste_mode = false;
                 },
                 .toggle_enabled => {
@@ -810,7 +763,12 @@ fn handleAction(self: *Shell, action: Action) !void {
                 },
                 .toggle_mode => {
                     self.vim_mode = if (self.vim_mode == .normal) .insert else .normal;
+                    self.vi.mode = if (self.vim_mode == .normal) .normal else .insert;
                     if (self.vim_mode == .normal) self.paste_mode = false;
+                },
+                .enter_visual => |vtype| {
+                    self.vi.mode = if (vtype == .line) .visual_line else .visual;
+                    self.vi.visual_start = self.edit_buf.cursor;
                 },
             }
             // update cursor style to match vim mode
@@ -819,22 +777,24 @@ fn handleAction(self: *Shell, action: Action) !void {
             else
                 CursorStyle.bar;
             try self.setCursorStyle(cursor);
-            return self.redrawLine();
+            // force redraw - prompt changed even if text didn't
+            self.term_view.last_hash = 0xDEADBEEF;
+            return self.renderLine();
         },
 
         .tap_complete => {
             if (self.completion_mode) {
-                try self.handleCompletionCycle(.forward);
+                try completion_mod.handleCompletionCycle(self,.forward);
             } else {
-                try self.handleTabCompletion();
+                try completion_mod.handleTabCompletion(self);
             }
         },
 
         .cycle_complete => |direction| {
             if (self.completion_mode) {
-                try self.handleCompletionCycle(direction);
+                try completion_mod.handleCompletionCycle(self,direction);
             } else {
-                try self.handleTabCompletion();
+                try completion_mod.handleTabCompletion(self);
             }
         },
 
@@ -859,7 +819,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             if (execute and self.search_len > 0 and self.history != null) {
                 const search_term = self.search_buffer[0..self.search_len];
                 const matches = self.history.?.fuzzySearch(search_term, self.allocator) catch {
-                    try self.redrawLine();
+                    try self.renderLine();
                     return;
                 };
                 defer self.allocator.free(matches);
@@ -868,101 +828,61 @@ fn handleAction(self: *Shell, action: Action) !void {
                     const entry_idx = matches[0].entry_index;
                     const entry = self.history.?.entries.items[entry_idx];
                     const cmd = self.history.?.getCommand(entry);
-
-                    const copy_len = @min(cmd.len, self.current_command.len);
-                    @memcpy(self.current_command[0..copy_len], cmd[0..copy_len]);
-                    self.current_command_len = copy_len;
-                    self.cursor_pos = copy_len;
-                }
+                    self.edit_buf.set(cmd);
+                                    }
             }
 
             self.search_len = 0;
-            try self.redrawLine();
+            try self.renderLine();
         },
 
         .yank => |yank_action| {
             switch (yank_action) {
                 .line => {
-                    @memcpy(
-                        self.clipboard[0..self.current_command_len],
-                        self.current_command[0..self.current_command_len],
-                    );
-                    self.clipboard_len = self.current_command_len;
+                    // yank to vim register
+                    const slice = self.edit_buf.slice();
+                    @memcpy(self.vi.yank_buf[0..slice.len], slice);
+                    self.vi.yank_len = @intCast(slice.len);
                 },
                 .selection => |sel| {
-                    if (sel.end > sel.start and sel.end <= self.current_command_len) {
+                    if (sel.end > sel.start and sel.end <= self.edit_buf.len) {
                         const len = sel.end - sel.start;
-                        @memcpy(
-                            self.clipboard[0..len],
-                            self.current_command[sel.start..sel.end],
-                        );
-                        self.clipboard_len = len;
+                        @memcpy(self.vi.yank_buf[0..len], self.edit_buf.text[sel.start..sel.end]);
+                        self.vi.yank_len = @intCast(len);
                     }
                 },
             }
         },
 
         .paste => |paste_action| {
-            if (self.clipboard_len == 0) return;
-            if (self.current_command_len + self.clipboard_len >= self.current_command.len)
-                return error.InputTooLong;
+            if (self.vi.yank_len == 0) return;
 
-            const insert_pos = switch (paste_action) {
-                .after_cursor => blk: {
-                    // paste after the character under cursor
-                    // if at end of line, paste at end; otherwise paste after current char
-                    break :blk if (self.cursor_pos < self.current_command_len)
-                        self.cursor_pos + 1
-                    else
-                        self.cursor_pos;
-                },
-                .before_cursor => self.cursor_pos, // paste before (at) the character under cursor
-            };
+            // position cursor for paste
+            if (paste_action == .after_cursor and self.edit_buf.cursor < self.edit_buf.len) {
+                _ = self.edit_buf.moveRight();
+            }
 
-            // Shift content right
-            @memmove(
-                self.current_command[insert_pos + self.clipboard_len .. self.current_command_len + self.clipboard_len],
-                self.current_command[insert_pos..self.current_command_len],
-            );
-
-            // Insert clipboard
-            @memcpy(
-                self.current_command[insert_pos .. insert_pos + self.clipboard_len],
-                self.clipboard[0..self.clipboard_len],
-            );
-
-            self.current_command_len += self.clipboard_len;
-            self.cursor_pos = insert_pos + self.clipboard_len;
-            try self.redrawLine();
+            // insert yanked text
+            _ = self.edit_buf.insertSlice(self.vi.yank_buf[0..self.vi.yank_len]);
+                        try self.renderLine();
         },
 
         .insert_at_position => |pos_type| {
             switch (pos_type) {
                 .cursor => {},
-                .after_cursor => {
-                    if (self.cursor_pos < self.current_command_len) {
-                        self.cursor_pos += 1;
-                        try self.handleCursorMovement(.{ .relative = 1 });
-                    }
-                },
-                .line_start => {
-                    self.cursor_pos = 0;
-                    try self.handleCursorMovement(.to_line_start);
-                },
-                .line_end => {
-                    self.cursor_pos = self.current_command_len;
-                    try self.handleCursorMovement(.to_line_end);
-                },
+                .after_cursor => _ = self.edit_buf.moveRight(),
+                .line_start => self.edit_buf.moveLineStart(),
+                .line_end => self.edit_buf.moveLineEnd(),
             }
+                        self.vi.mode = .insert;
             self.vim_mode = .insert;
             try self.setCursorStyle(.bar);
-            try self.redrawLine();
+            try self.renderLine();
         },
 
         .undo => {
-            self.current_command_len = 0;
-            self.cursor_pos = 0;
-            try self.redrawLine();
+            self.clearCommand();
+            try self.renderLine();
         },
 
         .enter_paste_mode => {
@@ -971,51 +891,51 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .exit_paste_mode => {
             self.paste_mode = false;
-            try self.redrawLine();
+            try self.renderLine();
         },
     }
 }
 
 fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
-    const old_pos = self.cursor_pos;
-    const max_pos = self.current_command_len;
-    const cmd = self.current_command[0..self.current_command_len];
+    const old_pos = self.edit_buf.cursor;
+    const max_pos = self.edit_buf.len;
+    const cmd = self.edit_buf.slice();
 
     // Handle line up/down specially - may need history fallback
     // In insert mode, always use history navigation for up/down
     switch (move_action) {
         .line_up => {
-            if (!self.vim_mode_enabled or self.vim_mode == .insert) {
+            if (!self.vim_mode_enabled or self.vi.mode == .insert) {
                 // Insert mode: just do history navigation
                 try self.handleHistoryNavigation(.up);
-                try self.redrawLine();
+                try self.renderLine();
             } else {
                 // Normal mode: line movement with history fallback
                 const result = self.findLinePosition(cmd, old_pos, true);
                 if (result.found) {
-                    self.cursor_pos = result.pos;
-                    try self.redrawLine();
+                    self.edit_buf.cursor = @intCast(result.pos);
+                                        try self.renderLine();
                 } else {
                     try self.handleHistoryNavigation(.up);
-                    try self.redrawLine();
+                    try self.renderLine();
                 }
             }
             return;
         },
         .line_down => {
-            if (!self.vim_mode_enabled or self.vim_mode == .insert) {
+            if (!self.vim_mode_enabled or self.vi.mode == .insert) {
                 // Insert mode: just do history navigation
                 try self.handleHistoryNavigation(.down);
-                try self.redrawLine();
+                try self.renderLine();
             } else {
                 // Normal mode: line movement with history fallback
                 const result = self.findLinePosition(cmd, old_pos, false);
                 if (result.found) {
-                    self.cursor_pos = result.pos;
-                    try self.redrawLine();
+                    self.edit_buf.cursor = @intCast(result.pos);
+                                        try self.renderLine();
                 } else {
                     try self.handleHistoryNavigation(.down);
-                    try self.redrawLine();
+                    try self.renderLine();
                 }
             }
             return;
@@ -1026,7 +946,7 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
     // Calculate new position (clamped to valid range)
     const new_pos = switch (move_action) {
         .relative => |steps| blk: {
-            const new = @as(isize, @intCast(self.cursor_pos)) + steps;
+            const new = @as(isize, @intCast(self.edit_buf.cursor)) + steps;
             break :blk @as(usize, @intCast(@max(0, @min(new, @as(isize, @intCast(max_pos))))));
         },
         .absolute => |pos| @min(pos, max_pos),
@@ -1039,11 +959,11 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
 
     if (new_pos == old_pos) return;
 
-    self.cursor_pos = new_pos;
-
-    // For multiline content, use redrawLine for proper positioning
+    self.edit_buf.cursor = @intCast(new_pos);
+    
+    // For multiline content, use renderLine for proper positioning
     if (std.mem.indexOfScalar(u8, cmd, '\n') != null) {
-        try self.redrawLine();
+        try self.renderLine();
     } else {
         const steps = if (new_pos > old_pos)
             new_pos - old_pos
@@ -1146,9 +1066,9 @@ fn findCurrentLineEnd(self: *Shell, cmd: []const u8, pos: usize) usize {
 }
 
 fn findWordForward(self: *Shell, boundary: WordBoundary) usize {
-    const buf = self.current_command[0..self.current_command_len];
-    var pos = self.cursor_pos;
-    const max = self.current_command_len;
+    const buf = self.edit_buf.slice();
+    var pos = self.edit_buf.cursor;
+    const max = self.edit_buf.len;
 
     if (pos >= max) return max;
 
@@ -1179,7 +1099,7 @@ fn findWordForward(self: *Shell, boundary: WordBoundary) usize {
             // Move to end of word
             while (pos < max and isWordChar(buf[pos])) : (pos += 1) {}
             // Back up one to be ON the last character
-            if (pos > self.cursor_pos) pos -= 1;
+            if (pos > self.edit_buf.cursor) pos -= 1;
             break :blk pos;
         },
         .WORD_end => blk: {
@@ -1194,17 +1114,17 @@ fn findWordForward(self: *Shell, boundary: WordBoundary) usize {
             // Move to end of WORD
             while (pos < max and !isWhitespace(buf[pos])) : (pos += 1) {}
             // Back up one to be ON the last character
-            if (pos > self.cursor_pos) pos -= 1;
+            if (pos > self.edit_buf.cursor) pos -= 1;
             break :blk pos;
         },
     };
 }
 
 fn findWordBackward(self: *Shell, boundary: WordBoundary) usize {
-    const buf = self.current_command[0..self.current_command_len];
-    if (self.cursor_pos == 0) return 0;
+    const buf = self.edit_buf.slice();
+    if (self.edit_buf.cursor == 0) return 0;
 
-    var pos = self.cursor_pos - 1;
+    var pos = self.edit_buf.cursor - 1;
 
     return switch (boundary) {
         .word, .word_end => blk: {
@@ -1327,6 +1247,9 @@ fn normalModeAction(char: u8) Action {
         '/' => .{ .enter_search_mode = .forward },
         '?' => .{ .enter_search_mode = .backward },
 
+        'v' => .{ .vim_mode = .{ .enter_visual = .char } },
+        'V' => .{ .vim_mode = .{ .enter_visual = .line } },
+
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
@@ -1337,25 +1260,26 @@ fn normalModeAction(char: u8) Action {
 }
 
 fn escapeSequenceAction() !Action {
-    const stdin = std.fs.File.stdin();
+    const stdin_fd = std.posix.STDIN_FILENO;
     var temp_buf: [3]u8 = undefined;
 
-    // Set stdin to non-blocking mode to check if there's more data
-    // If fcntl fails, default to 0 flags (safe fallback for non-blocking check)
-    const flags = std.posix.fcntl(stdin.handle, std.posix.F.GETFL, 0) catch 0;
-    // Attempt to set non-blocking mode. If it fails, stdin remains blocking
-    // which is acceptable - we'll just wait for input instead of detecting ESC immediately
-    _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags | 0o4000) catch {}; // O_NONBLOCK
+    // Set non-blocking temporarily via system call
+    const F_GETFL = 3;
+    const F_SETFL = 4;
+    const O_NONBLOCK = 0x800;
 
-    // If read fails in non-blocking mode, treat as no data available (ESC key press)
-    const bytes_read = stdin.read(&temp_buf) catch 0;
+    const flags = std.posix.system.fcntl(stdin_fd, F_GETFL, @as(usize, 0));
+    _ = std.posix.system.fcntl(stdin_fd, F_SETFL, flags | O_NONBLOCK);
+    defer _ = std.posix.system.fcntl(stdin_fd, F_SETFL, flags);
 
-    // Restore blocking mode. If this fails, subsequent input may behave unexpectedly
-    // but the shell will still function. Terminal state is restored on shell exit.
-    _ = std.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags) catch {};
+    // Try to read - if nothing there (EAGAIN), it's just ESC
+    const result = std.posix.system.read(stdin_fd, &temp_buf, temp_buf.len);
+    if (result <= 0) {
+        return .{ .vim_mode = .{ .set_mode = .normal } };
+    }
+    const bytes_read: usize = @intCast(result);
 
-    // If no following bytes or not '[', it's just ESC key press
-    if (bytes_read == 0 or temp_buf[0] != '[') {
+    if (temp_buf[0] != '[') {
         return .{ .vim_mode = .{ .set_mode = .normal } };
     }
 
@@ -1541,14 +1465,14 @@ fn handleHistoryNavigation(self: *Shell, direction: HistoryDirection) !void {
             if (self.history_index == -1) {
                 self.history_index = @intCast(h.entries.items.len);
                 // Save prefix for prefix-based search
-                self.history_search_prefix_len = self.current_command_len;
+                self.history_search_prefix_len = self.edit_buf.len;
             }
 
             // Move up in history with optional prefix filtering
             if (self.history_index > 0) {
                 if (self.history_search_prefix_len > 0) {
                     // Prefix search - find previous matching entry
-                    const prefix = self.current_command[0..self.history_search_prefix_len];
+                    const prefix = self.edit_buf.text[0..self.history_search_prefix_len];
                     var idx = self.history_index - 1;
                     while (idx >= 0) : (idx -= 1) {
                         const entry = h.entries.items[@intCast(idx)];
@@ -1573,7 +1497,7 @@ fn handleHistoryNavigation(self: *Shell, direction: HistoryDirection) !void {
 
             if (self.history_search_prefix_len > 0) {
                 // Prefix search - find next matching entry
-                const prefix = self.current_command[0..self.history_search_prefix_len];
+                const prefix = self.edit_buf.text[0..self.history_search_prefix_len];
                 var idx = self.history_index + 1;
                 const max_idx: i32 = @intCast(h.entries.items.len);
                 while (idx < max_idx) : (idx += 1) {
@@ -1587,9 +1511,9 @@ fn handleHistoryNavigation(self: *Shell, direction: HistoryDirection) !void {
                 } else {
                     // No more matches - restore prefix
                     self.history_index = -1;
-                    self.current_command_len = self.history_search_prefix_len;
-                    self.cursor_pos = self.history_search_prefix_len;
-                    self.history_search_prefix_len = 0;
+                    self.edit_buf.len = @intCast(self.history_search_prefix_len);
+                    self.edit_buf.cursor = @intCast(self.history_search_prefix_len);
+                                        self.history_search_prefix_len = 0;
                 }
             } else {
                 self.history_index += 1;
@@ -1597,8 +1521,7 @@ fn handleHistoryNavigation(self: *Shell, direction: HistoryDirection) !void {
                 // Reached the end - clear command (back to empty current line)
                 if (self.history_index >= @as(i32, @intCast(h.entries.items.len))) {
                     self.history_index = -1;
-                    self.current_command_len = 0;
-                    self.cursor_pos = 0;
+                    self.clearCommand();
                 } else {
                     try self.loadHistoryEntry(h);
                 }
@@ -1607,913 +1530,16 @@ fn handleHistoryNavigation(self: *Shell, direction: HistoryDirection) !void {
     }
 
     // Redraw the line with new content
-    try self.redrawLine();
+    try self.renderLine();
 }
 
 fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
     const entry = h.entries.items[@intCast(self.history_index)];
     const history_cmd = h.getCommand(entry);
 
-    // Copy history command to current_command buffer
-    const copy_len = @min(history_cmd.len, self.current_command.len);
-    @memcpy(self.current_command[0..copy_len], history_cmd[0..copy_len]);
-
-    // Update current command length and cursor position
-    self.current_command_len = copy_len;
-    self.cursor_pos = copy_len;
-}
-
-fn tryGitCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
-    // check if command starts with "git "
-    if (!std.mem.startsWith(u8, cmd, "git ")) return false;
-    if (!git.isRepo()) return false;
-
-    // parse git subcommand
-    const after_git = cmd[4..];
-    var parts = std.mem.splitScalar(u8, after_git, ' ');
-    const subcommand = parts.next() orelse return false;
-
-    // get matches based on subcommand
-    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
-    defer {
-        for (matches.items) |m| self.allocator.free(m);
-        matches.deinit(self.allocator);
+    // Set edit buffer to history command
+    self.edit_buf.set(history_cmd);
     }
-
-    const pattern = word_result.word;
-
-    if (std.mem.eql(u8, subcommand, "add") or
-        std.mem.eql(u8, subcommand, "restore") or
-        std.mem.eql(u8, subcommand, "diff"))
-    {
-        // complete with modified/deleted/untracked files
-        if (git.getStatus(self.allocator)) |s| {
-            var status = s;
-            defer status.deinit();
-
-            for (status.modified.items) |file| {
-                if (std.mem.startsWith(u8, file, pattern)) {
-                    matches.append(self.allocator, self.allocator.dupe(u8, file) catch continue) catch {};
-                }
-            }
-            for (status.deleted.items) |file| {
-                if (std.mem.startsWith(u8, file, pattern)) {
-                    matches.append(self.allocator, self.allocator.dupe(u8, file) catch continue) catch {};
-                }
-            }
-            for (status.untracked.items) |file| {
-                if (std.mem.startsWith(u8, file, pattern)) {
-                    matches.append(self.allocator, self.allocator.dupe(u8, file) catch continue) catch {};
-                }
-            }
-        }
-    } else if (std.mem.eql(u8, subcommand, "checkout") or
-        std.mem.eql(u8, subcommand, "switch") or
-        std.mem.eql(u8, subcommand, "merge") or
-        std.mem.eql(u8, subcommand, "rebase"))
-    {
-        // complete with branches
-        try self.getGitBranches(&matches, pattern);
-    } else if (std.mem.eql(u8, subcommand, "branch")) {
-        // check for -d flag
-        var has_delete = false;
-        while (parts.next()) |part| {
-            if (std.mem.eql(u8, part, "-d") or std.mem.eql(u8, part, "-D") or
-                std.mem.eql(u8, part, "--delete"))
-            {
-                has_delete = true;
-                break;
-            }
-        }
-        if (has_delete) {
-            try self.getGitBranches(&matches, pattern);
-        }
-    } else {
-        return false; // not a git subcommand we handle
-    }
-
-    if (matches.items.len == 0) return false;
-
-    // apply completion
-    if (matches.items.len == 1) {
-        return try self.applySingleCompletion(matches.items[0], word_result);
-    } else {
-        return try self.showCompletionMatches(&matches, word_result, pattern);
-    }
-}
-
-fn getGitBranches(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []const u8) !void {
-    // read branches from .git/refs/heads/
-    const refs_dir = std.fs.cwd().openDir(".git/refs/heads", .{ .iterate = true }) catch return;
-    var dir = refs_dir;
-    defer dir.close();
-
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        if (entry.kind == .file and std.mem.startsWith(u8, entry.name, pattern)) {
-            const branch = try self.allocator.dupe(u8, entry.name);
-            try matches.append(self.allocator, branch);
-        }
-    }
-}
-
-fn applySingleCompletion(self: *Shell, match: []const u8, word_result: WordResult) !bool {
-    const pattern = word_result.word;
-    const word_end = word_result.end;
-    const comp_str = match[pattern.len..];
-
-    const new_len = self.current_command_len + comp_str.len;
-    if (new_len >= self.current_command.len) return error.InputTooLong;
-
-    if (word_end < self.current_command_len) {
-        @memmove(
-            self.current_command[word_end + comp_str.len .. new_len],
-            self.current_command[word_end..self.current_command_len],
-        );
-    }
-
-    @memcpy(self.current_command[word_end .. word_end + comp_str.len], comp_str);
-    self.current_command_len = new_len;
-    self.cursor_pos = word_end + comp_str.len;
-    try self.redrawLine();
-    return true;
-}
-
-fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word_result: WordResult, pattern: []const u8) !bool {
-    // find longest common prefix among all matches
-    if (matches.items.len == 0) return false;
-
-    var common_prefix_len: usize = matches.items[0].len;
-    for (matches.items[1..]) |match| {
-        var i: usize = 0;
-        while (i < common_prefix_len and i < match.len and matches.items[0][i] == match[i]) : (i += 1) {}
-        common_prefix_len = i;
-    }
-
-    // if common prefix is longer than pattern, complete to that first
-    if (common_prefix_len > pattern.len) {
-        const common_prefix = matches.items[0][0..common_prefix_len];
-        const comp_str = common_prefix[pattern.len..];
-        const word_end = word_result.end;
-
-        // insert completion
-        if (word_end + comp_str.len < types.MAX_COMMAND_LENGTH) {
-            // shift existing text to make room
-            const tail_len = self.current_command_len - word_end;
-            if (tail_len > 0) {
-                std.mem.copyBackwards(u8, self.current_command[word_end + comp_str.len ..], self.current_command[word_end .. word_end + tail_len]);
-            }
-            @memcpy(self.current_command[word_end .. word_end + comp_str.len], comp_str);
-            self.current_command_len += comp_str.len;
-            self.cursor_pos = word_end + comp_str.len;
-            try self.redrawLine();
-        }
-        return true;
-    }
-
-    // common prefix equals pattern, show all matches
-    self.exitCompletionMode();
-
-    for (matches.items) |match| {
-        const owned = try self.allocator.dupe(u8, match);
-        try self.completion_matches.append(self.allocator, owned);
-    }
-
-    self.completion_mode = true;
-    self.completion_index = self.completion_matches.items.len;
-    self.completion_word_start = word_result.start;
-    self.completion_word_end = word_result.end;
-    self.completion_original_len = self.current_command_len;
-    self.completion_pattern_len = word_result.word.len;
-
-    try self.displayCompletions();
-    return true;
-}
-
-fn handleTabCompletion(self: *Shell) !void {
-    if (self.current_command_len == 0) return;
-
-    // find the word at cursor position
-    const cmd = self.current_command[0..self.current_command_len];
-    const word_result = self.extractWordAtCursor(cmd) orelse return;
-
-    const word = word_result.word;
-    const word_end = word_result.end;
-
-    // check for git-aware completion
-    if (try self.tryGitCompletion(cmd, word_result)) return;
-
-    // determine base directory and search pattern
-    // expand ~ to home directory if needed
-    var expanded_dir_buf: [4096]u8 = undefined;
-    const search_dir: []const u8 = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash| blk: {
-        if (last_slash == 0) {
-            // absolute path like "/etc"
-            break :blk "/";
-        } else {
-            const dir_part = word[0..last_slash];
-            // expand ~ at start
-            if (std.mem.startsWith(u8, dir_part, "~")) {
-                const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk dir_part;
-                defer self.allocator.free(home);
-                const rest = dir_part[1..]; // skip ~
-                const expanded_len = home.len + rest.len;
-                if (expanded_len < expanded_dir_buf.len) {
-                    @memcpy(expanded_dir_buf[0..home.len], home);
-                    @memcpy(expanded_dir_buf[home.len..expanded_len], rest);
-                    break :blk expanded_dir_buf[0..expanded_len];
-                }
-            }
-            break :blk dir_part;
-        }
-    } else if (std.mem.eql(u8, word, "~")) blk: {
-        // just "~" - expand to home
-        const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk ".";
-        defer self.allocator.free(home);
-        if (home.len < expanded_dir_buf.len) {
-            @memcpy(expanded_dir_buf[0..home.len], home);
-            break :blk expanded_dir_buf[0..home.len];
-        }
-        break :blk ".";
-    } else "."; // no slash, search in current directory
-
-    const pattern = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash|
-        word[last_slash + 1 ..]
-    else if (std.mem.eql(u8, word, "~"))
-        "" // empty pattern to match all in home
-    else
-        word;
-
-    // find matches
-    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
-    defer {
-        for (matches.items) |match| {
-            self.allocator.free(match);
-        }
-        matches.deinit(self.allocator);
-    }
-
-    // collect existing arguments to filter out
-    var existing_args = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
-    defer existing_args.deinit(self.allocator);
-
-    var arg_start: usize = 0;
-    var in_arg = false;
-    for (cmd, 0..) |c, idx| {
-        if (c == ' ' or c == '\t' or c == '\n') {
-            if (in_arg and idx > arg_start) {
-                // don't include the word we're currently completing
-                if (arg_start != word_result.start) {
-                    existing_args.append(self.allocator, cmd[arg_start..idx]) catch {};
-                }
-            }
-            in_arg = false;
-        } else {
-            if (!in_arg) {
-                arg_start = idx;
-                in_arg = true;
-            }
-        }
-    }
-    // handle last argument if not whitespace terminated
-    if (in_arg and arg_start != word_result.start and self.current_command_len > arg_start) {
-        existing_args.append(self.allocator, cmd[arg_start..self.current_command_len]) catch {};
-    }
-
-    const dir = std.fs.cwd().openDir(search_dir, .{ .iterate = true }) catch return;
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        if (std.mem.startsWith(u8, entry.name, pattern)) {
-            // check if this entry is already in the command
-            var already_exists = false;
-            for (existing_args.items) |existing| {
-                // compare just the filename part of existing arg
-                const existing_name = if (std.mem.lastIndexOf(u8, existing, "/")) |slash|
-                    existing[slash + 1 ..]
-                else
-                    existing;
-
-                if (std.mem.eql(u8, entry.name, existing_name)) {
-                    already_exists = true;
-                    break;
-                }
-                // also check with trailing slash for directories
-                if (entry.kind == .directory) {
-                    const with_slash = std.fmt.allocPrint(self.allocator, "{s}/", .{entry.name}) catch continue;
-                    defer self.allocator.free(with_slash);
-                    if (std.mem.eql(u8, with_slash, existing_name)) {
-                        already_exists = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!already_exists) {
-                const full_name = if (entry.kind == .directory)
-                    try std.fmt.allocPrint(self.allocator, "{s}/", .{entry.name})
-                else
-                    try self.allocator.dupe(u8, entry.name);
-                try matches.append(self.allocator, full_name);
-            }
-        }
-    }
-
-    if (matches.items.len == 0) {
-        // no matches, do nothing
-        return;
-    } else if (matches.items.len == 1) {
-        // single match - complete it
-        const match = matches.items[0];
-        const comp_str = match[pattern.len..];
-
-        // insert completion at cursor
-        const new_len = self.current_command_len + comp_str.len;
-        if (new_len >= self.current_command.len) return error.InputTooLong;
-
-        // shift content after word_end to make room
-        if (word_end < self.current_command_len) {
-            @memmove(
-                self.current_command[word_end + comp_str.len .. new_len],
-                self.current_command[word_end..self.current_command_len],
-            );
-        }
-
-        // insert completion
-        @memcpy(
-            self.current_command[word_end .. word_end + comp_str.len],
-            comp_str,
-        );
-
-        self.current_command_len = new_len;
-        self.cursor_pos = word_end + comp_str.len;
-        try self.redrawLine();
-    } else {
-        // multiple matches - first try common prefix completion
-        var common_prefix_len: usize = matches.items[0].len;
-        for (matches.items[1..]) |match| {
-            var i: usize = 0;
-            while (i < common_prefix_len and i < match.len and matches.items[0][i] == match[i]) : (i += 1) {}
-            common_prefix_len = i;
-        }
-
-        // if common prefix is longer than pattern, complete to that first
-        if (common_prefix_len > pattern.len) {
-            const common_prefix = matches.items[0][0..common_prefix_len];
-            const comp_str = common_prefix[pattern.len..];
-
-            // insert completion
-            if (word_end + comp_str.len < types.MAX_COMMAND_LENGTH) {
-                const tail_len = self.current_command_len - word_end;
-                if (tail_len > 0) {
-                    std.mem.copyBackwards(u8, self.current_command[word_end + comp_str.len ..], self.current_command[word_end .. word_end + tail_len]);
-                }
-                @memcpy(self.current_command[word_end .. word_end + comp_str.len], comp_str);
-                self.current_command_len += comp_str.len;
-                self.cursor_pos = word_end + comp_str.len;
-                try self.redrawLine();
-            }
-            return;
-        }
-
-        // common prefix equals pattern - enter completion mode
-        self.exitCompletionMode();
-
-        for (matches.items) |match| {
-            const owned = try self.allocator.dupe(u8, match);
-            try self.completion_matches.append(self.allocator, owned);
-        }
-
-        self.completion_mode = true;
-        self.completion_index = self.completion_matches.items.len; // invalid index = nothing selected
-        self.completion_word_start = word_result.start;
-        self.completion_word_end = word_end;
-        self.completion_original_len = self.current_command_len;
-        self.completion_pattern_len = pattern.len;
-
-        // just show all matches without selecting any (zsh-style)
-        try self.displayCompletions();
-    }
-}
-
-const WordResult = struct {
-    word: []const u8,
-    start: usize,
-    end: usize,
-};
-
-fn extractWordAtCursor(self: *Shell, cmd: []const u8) ?WordResult {
-    if (cmd.len == 0) return null;
-
-    // find word boundaries around cursor
-    var start = self.cursor_pos;
-    var end = self.cursor_pos;
-
-    // find start of word (go backwards until space or start)
-    while (start > 0 and cmd[start - 1] != ' ') {
-        start -= 1;
-    }
-
-    // find end of word (go forward until space or end)
-    while (end < cmd.len and cmd[end] != ' ') {
-        end += 1;
-    }
-
-    // Allow empty pattern (cursor after space) - will match all files
-    return WordResult{
-        .word = cmd[start..end],
-        .start = start,
-        .end = end,
-    };
-}
-
-fn exitCompletionMode(self: *Shell) void {
-    if (!self.completion_mode) return;
-
-    // free all completion matches
-    for (self.completion_matches.items) |match| {
-        self.allocator.free(match);
-    }
-    self.completion_matches.clearRetainingCapacity();
-
-    self.completion_mode = false;
-    self.completion_index = 0;
-    self.completion_pattern_len = 0;
-    self.completion_menu_lines = 0;
-    self.completion_displayed = false;
-}
-
-fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
-    if (self.completion_matches.items.len == 0) return;
-
-    const old_index = self.completion_index;
-    const nothing_selected = old_index >= self.completion_matches.items.len;
-
-    // cycle index
-    switch (direction) {
-        .forward => {
-            if (nothing_selected) {
-                self.completion_index = 0; // first selection
-            } else {
-                self.completion_index = (self.completion_index + 1) % self.completion_matches.items.len;
-            }
-        },
-        .backward => {
-            if (nothing_selected) {
-                self.completion_index = self.completion_matches.items.len - 1; // select last
-            } else if (self.completion_index == 0) {
-                self.completion_index = self.completion_matches.items.len - 1;
-            } else {
-                self.completion_index -= 1;
-            }
-        },
-    }
-
-    // apply the new completion
-    try self.applyCompletion(self.completion_pattern_len);
-
-    if (self.completion_displayed) {
-        // menu already shown - just update highlight
-        try self.updateCompletionHighlight(old_index);
-    } else {
-        // display menu for first time
-        try self.displayCompletions();
-    }
-}
-
-fn applyCompletion(self: *Shell, pattern_len: usize) !void {
-    if (self.completion_matches.items.len == 0) return;
-
-    const match = self.completion_matches.items[self.completion_index];
-
-    // calculate how much of the match to add (skip the pattern prefix)
-    const comp_str = match[pattern_len..];
-
-    // restore command to original state first
-    self.current_command_len = self.completion_original_len;
-
-    // calculate new length
-    const new_len = self.current_command_len + comp_str.len;
-    if (new_len >= self.current_command.len) return error.InputTooLong;
-
-    // shift content after word_end to make room
-    if (self.completion_word_end < self.current_command_len) {
-        @memmove(
-            self.current_command[self.completion_word_end + comp_str.len .. new_len],
-            self.current_command[self.completion_word_end..self.current_command_len],
-        );
-    }
-
-    // insert completion
-    @memcpy(
-        self.current_command[self.completion_word_end .. self.completion_word_end + comp_str.len],
-        comp_str,
-    );
-
-    self.current_command_len = new_len;
-    self.cursor_pos = self.completion_word_end + comp_str.len;
-}
-
-fn displayCompletions(self: *Shell) !void {
-    if (self.completion_matches.items.len == 0) return;
-
-    const term_width = self.terminal_width;
-    const term_height = self.terminal_height;
-
-    // calculate available space: terminal height - prompt line - input line - 1 for safety
-    const max_menu_height = if (term_height > 3) term_height - 3 else 1;
-
-    // in narrow terminals, use simple single-column display to avoid wrapping issues
-    if (term_width < 80) {
-        try self.stdout().writeByte('\n');
-
-        // cap the number of items displayed to available height
-        const items_to_show = @min(self.completion_matches.items.len, max_menu_height);
-
-        // if we can't show all items, show context around selected item
-        const start_idx = if (self.completion_matches.items.len > items_to_show) blk: {
-            // center the selected item in the visible window
-            const half_window = items_to_show / 2;
-            if (self.completion_index < half_window) {
-                break :blk 0;
-            } else if (self.completion_index + half_window >= self.completion_matches.items.len) {
-                break :blk self.completion_matches.items.len - items_to_show;
-            } else {
-                break :blk self.completion_index - half_window;
-            }
-        } else 0;
-
-        const end_idx = @min(start_idx + items_to_show, self.completion_matches.items.len);
-
-        for (self.completion_matches.items[start_idx..end_idx], start_idx..) |match, i| {
-            if (i == self.completion_index and self.completion_index < self.completion_matches.items.len) {
-                try self.stdout().print("{f}{s}{f}\n", .{ tty.Style.reverse, match, tty.Style.reset });
-            } else {
-                try self.stdout().print("{s}\n", .{match});
-            }
-        }
-
-        // show indicator if there are more items
-        if (end_idx < self.completion_matches.items.len) {
-            try self.stdout().print("... ({} more)\n", .{self.completion_matches.items.len - end_idx});
-            self.completion_menu_lines = items_to_show + 1;
-        } else if (start_idx > 0) {
-            try self.stdout().print("... ({} hidden above)\n", .{start_idx});
-            self.completion_menu_lines = items_to_show + 1;
-        } else {
-            self.completion_menu_lines = items_to_show;
-        }
-
-        try self.redrawLine();
-        self.completion_displayed = true;
-        return;
-    }
-
-    // for normal terminals, show matches in columns
-    try self.stdout().writeByte('\n');
-
-    // find max length but cap at reasonable width
-    const max_item_width: usize = 30;
-    var max_len: usize = 0;
-    for (self.completion_matches.items) |match| {
-        const display_len = @min(match.len, max_item_width);
-        if (display_len > max_len) max_len = display_len;
-    }
-    const col_width = max_len + 2;
-    const max_line_width: usize = 120; // limit total line width
-    const effective_width = @min(term_width, max_line_width);
-    const cols = @max(1, effective_width / col_width);
-
-    const total_menu_lines = (self.completion_matches.items.len + cols - 1) / cols;
-    const menu_lines = @min(total_menu_lines, max_menu_height);
-    self.completion_menu_lines = menu_lines;
-
-    // calculate how many items we can display
-    const max_items = menu_lines * cols;
-    const items_to_show = @min(self.completion_matches.items.len, max_items);
-
-    for (self.completion_matches.items[0..items_to_show], 0..) |match, i| {
-        // truncate if needed
-        const display_name = if (match.len > max_item_width)
-            match[0 .. max_item_width - 1]
-        else
-            match;
-        const truncated = match.len > max_item_width;
-
-        if (i == self.completion_index and self.completion_index < self.completion_matches.items.len) {
-            try self.stdout().print("{f}{s}", .{ tty.Style.reverse, display_name });
-            if (truncated) try self.stdout().writeByte('~');
-            try self.stdout().print("{f}", .{tty.Style.reset});
-        } else {
-            try self.stdout().print("{s}", .{display_name});
-            if (truncated) try self.stdout().writeByte('~');
-        }
-
-        const actual_len = if (truncated) max_item_width else match.len;
-        const padding = col_width - actual_len;
-        var j: usize = 0;
-        while (j < padding) : (j += 1) {
-            try self.stdout().writeByte(' ');
-        }
-
-        if ((i + 1) % cols == 0 or i == items_to_show - 1) {
-            try self.stdout().writeByte('\n');
-        }
-    }
-
-    // show indicator if there are more items
-    if (items_to_show < self.completion_matches.items.len) {
-        try self.stdout().print("... ({} more matches)\n", .{self.completion_matches.items.len - items_to_show});
-        self.completion_menu_lines += 1;
-    }
-
-    try self.redrawLine();
-    self.completion_displayed = true;
-}
-
-fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
-    const term_width = self.terminal_width;
-
-    // first selection - just highlight first item in existing menu
-    if (old_index >= self.completion_matches.items.len) {
-        const max_item_width: usize = 30;
-        var max_len: usize = 0;
-        for (self.completion_matches.items) |match| {
-            const display_len = @min(match.len, max_item_width);
-            if (display_len > max_len) max_len = display_len;
-        }
-        const col_width = max_len + 2;
-        const max_line_width: usize = 120;
-        const effective_width = @min(term_width, max_line_width);
-        const cols = @max(1, effective_width / col_width);
-
-        // new_index is 0 (first item)
-        const new_row = self.completion_index / cols;
-        const new_col = self.completion_index % cols;
-
-        // move up from prompt to top of menu area
-        const lines_up = self.completion_menu_lines + 1;
-        try self.stdout().print("\x1b[{d}A", .{lines_up});
-
-        // move down to first item row
-        try self.stdout().print("\x1b[{d}B", .{new_row + 1});
-        const new_col_pos = new_col * col_width;
-        try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
-        // draw highlighted
-        try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
-
-        // move back to bottom of menu and below
-        const current_row = new_row + 1;
-        const rows_to_bottom = self.completion_menu_lines - current_row;
-        if (rows_to_bottom > 0) {
-            try self.stdout().print("\x1b[{d}B", .{rows_to_bottom});
-        }
-        try self.stdout().print("\x1b[{d}B", .{1});
-
-        try self.stdout().writeAll("\r\x1b[K");
-        try self.redrawLine();
-        return;
-    }
-
-    // for narrow terminals, redisplay everything
-    if (term_width < 80) {
-        // move to beginning of current line, then move up to top of menu
-        try self.stdout().writeAll("\r");
-        if (self.completion_menu_lines > 0) {
-            try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
-        }
-        // clear from here to end of screen
-        try self.stdout().writeAll("\x1b[J");
-        // redraw everything
-        try self.displayCompletions();
-        return;
-    }
-
-    // for normal terminals, use optimized cursor-based update
-    const max_item_width: usize = 30;
-    var max_len: usize = 0;
-    for (self.completion_matches.items) |match| {
-        const display_len = @min(match.len, max_item_width);
-        if (display_len > max_len) max_len = display_len;
-    }
-    const col_width = max_len + 2;
-    const max_line_width: usize = 120;
-    const effective_width = @min(term_width, max_line_width);
-    const cols = @max(1, effective_width / col_width);
-
-    const old_row = old_index / cols;
-    const old_col = old_index % cols;
-    const new_row = self.completion_index / cols;
-    const new_col = self.completion_index % cols;
-
-    const lines_up = self.completion_menu_lines + 1;
-    try self.stdout().print("\x1b[{d}A", .{lines_up});
-
-    try self.stdout().print("\x1b[{d}B", .{old_row + 1});
-    const old_col_pos = old_col * col_width;
-    try self.stdout().print("\x1b[{d}G", .{old_col_pos + 1});
-    try self.stdout().print("{s}", .{self.completion_matches.items[old_index]});
-
-    if (new_row > old_row) {
-        try self.stdout().print("\x1b[{d}B", .{new_row - old_row});
-    } else if (old_row > new_row) {
-        try self.stdout().print("\x1b[{d}A", .{old_row - new_row});
-    }
-    const new_col_pos = new_col * col_width;
-    try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
-    try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
-
-    const current_row = new_row + 1;
-    const rows_to_bottom = self.completion_menu_lines - current_row;
-    if (rows_to_bottom > 0) {
-        try self.stdout().print("\x1b[{d}B", .{rows_to_bottom});
-    }
-    try self.stdout().print("\x1b[{d}B", .{1});
-
-    try self.stdout().writeAll("\r\x1b[K");
-    try self.redrawLine();
-}
-
-fn redrawLine(self: *Shell) !void {
-    const prompt_len = self.calculatePromptLength();
-    const term_width = if (self.terminal_width > 0) self.terminal_width else 80;
-    const cmd = self.current_command[0..self.current_command_len];
-    const continuation_marker_len: usize = 2; // "│ "
-
-    // Count total display lines for the new content
-    var new_lines: usize = 1;
-    var col: usize = prompt_len;
-    for (cmd) |c| {
-        if (c == '\n') {
-            new_lines += 1;
-            col = continuation_marker_len;
-        } else {
-            col += 1;
-            if (col >= term_width) {
-                new_lines += 1;
-                col = 0;
-            }
-        }
-    }
-
-    // Use terminal_cursor_row (where terminal cursor actually is)
-    // This tracks real terminal state, not buffer cursor position
-    const actual_cursor_row = self.terminal_cursor_row;
-
-    // Only clear lines we actually own (displayed_cmd_lines), not new_lines
-    // New lines will be added by outputting content
-    const lines_to_clear = self.displayed_cmd_lines;
-
-    // Move cursor up to the first line of OUR content
-    if (actual_cursor_row > 0) {
-        try self.stdout().print("\x1b[{d}A", .{actual_cursor_row});
-    }
-    try self.stdout().writeAll("\r");
-
-    // Clear only the lines we previously displayed
-    for (0..lines_to_clear) |i| {
-        try self.stdout().writeAll("\x1b[2K");
-        if (i < lines_to_clear - 1) {
-            try self.stdout().writeAll("\x1b[1B");
-        }
-    }
-
-    // Move back to the first line
-    if (lines_to_clear > 1) {
-        try self.stdout().print("\x1b[{d}A", .{lines_to_clear - 1});
-    }
-    try self.stdout().writeAll("\r");
-
-    // Update tracked line count
-    self.displayed_cmd_lines = new_lines;
-
-    // Redraw prompt
-    try self.printFancyPrompt();
-
-    // Write current command buffer with continuation markers and syntax highlighting
-    if (self.current_command_len > 0) {
-        if (self.enable_highlighting) {
-            // Apply syntax highlighting
-            self.highlight_buffer.clearRetainingCapacity();
-            self.highlighter.highlight(cmd, &self.highlight_buffer) catch {
-                // On highlight error, fall back to plain output
-                for (cmd) |c| {
-                    if (c == '\n') {
-                        try self.stdout().writeAll("\n\x1b[90m│\x1b[0m ");
-                    } else {
-                        try self.stdout().writeByte(c);
-                    }
-                }
-                return;
-            };
-            // Write highlighted output, handling newlines for continuation
-            var i: usize = 0;
-            const highlighted = self.highlight_buffer.items;
-            while (i < highlighted.len) {
-                if (highlighted[i] == '\n') {
-                    try self.stdout().writeAll("\x1b[0m\n\x1b[90m│\x1b[0m ");
-                    i += 1;
-                } else {
-                    try self.stdout().writeByte(highlighted[i]);
-                    i += 1;
-                }
-            }
-            // Reset colors at end
-            try self.stdout().writeAll("\x1b[0m");
-        } else {
-            // Plain output without highlighting
-            for (cmd) |c| {
-                if (c == '\n') {
-                    try self.stdout().writeAll("\n\x1b[90m│\x1b[0m ");
-                } else {
-                    try self.stdout().writeByte(c);
-                }
-            }
-        }
-    }
-
-    // Calculate cursor position (accounting for newlines, continuation markers, and wrapping)
-    const continuation_len: usize = 2; // "│ "
-    var cursor_line: usize = 0;
-    var cursor_col: usize = prompt_len;
-    for (cmd[0..self.cursor_pos]) |c| {
-        if (c == '\n') {
-            cursor_line += 1;
-            cursor_col = continuation_len;
-        } else {
-            cursor_col += 1;
-            if (cursor_col >= term_width) {
-                cursor_line += 1;
-                cursor_col = 0;
-            }
-        }
-    }
-
-    // Calculate end position
-    var end_line: usize = 0;
-    var end_col: usize = prompt_len;
-    for (cmd) |c| {
-        if (c == '\n') {
-            end_line += 1;
-            end_col = continuation_len;
-        } else {
-            end_col += 1;
-            if (end_col >= term_width) {
-                end_line += 1;
-                end_col = 0;
-            }
-        }
-    }
-
-    // Move cursor from end position to desired position
-    if (cursor_line < end_line) {
-        try self.stdout().print("\x1b[{d}A", .{end_line - cursor_line});
-    }
-
-    // Move to correct column
-    if (cursor_col == 0) {
-        try self.stdout().writeAll("\r");
-    } else {
-        try self.stdout().print("\r\x1b[{d}C", .{cursor_col});
-    }
-
-    // Update terminal cursor row tracking
-    self.terminal_cursor_row = cursor_line;
-
-    try self.stdout().flush();
-}
-
-fn calculatePromptLength(self: *Shell) usize {
-    // approximate visible length of prompt (without ANSI codes)
-    // format: [X] user@host path $
-    const user = std.process.getEnvVarOwned(self.allocator, "USER") catch "unknown";
-    defer if (!std.mem.eql(u8, user, "unknown")) self.allocator.free(user);
-
-    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    const hostname = std.posix.gethostname(&hostname_buf) catch "localhost";
-
-    var cwd_buf: [4096]u8 = undefined;
-    const full_cwd = std.posix.getcwd(&cwd_buf) catch "/";
-
-    const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch null;
-    defer if (home) |h| self.allocator.free(h);
-
-    const display_path = if (home) |h| blk: {
-        if (std.mem.startsWith(u8, full_cwd, h)) {
-            if (std.mem.eql(u8, full_cwd, h)) {
-                break :blk "~";
-            } else {
-                var path_buf: [4096]u8 = undefined;
-                const rest = full_cwd[h.len..];
-                break :blk std.fmt.bufPrint(&path_buf, "~{s}", .{rest}) catch full_cwd;
-            }
-        } else {
-            break :blk full_cwd;
-        }
-    } else full_cwd;
-
-    // [X] user@host path $
-    return 4 + user.len + 1 + hostname.len + 1 + display_path.len + 3;
-}
 
 fn loadAliases(self: *Shell) !void {
     // get home directory
@@ -2645,28 +1671,6 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     self.last_exit_code = exit_code;
     return exit_code;
 }
-
-fn resolveAlias(self: *Shell, command: []const u8) []const u8 {
-    // find first word (command name)
-    const space_pos = std.mem.indexOf(u8, command, " ");
-    const cmd_name = if (space_pos) |pos| command[0..pos] else command;
-
-    // check if it's an alias
-    if (self.aliases.get(cmd_name)) |alias_value| {
-        // replace the command name with the alias value
-        if (space_pos) |pos| {
-            const args = command[pos..];
-            const resolved = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ alias_value, args }) catch return command;
-            return resolved;
-        } else {
-            const resolved = self.allocator.dupe(u8, alias_value) catch return command;
-            return resolved;
-        }
-    }
-
-    return command;
-}
-
 pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
     // Simple variable expansion - replace $VAR with variable value
     var result = try std.ArrayList(u8).initCapacity(self.allocator, input.len);
@@ -3004,259 +2008,18 @@ fn executeExternalAndCapture(self: *Shell, command: []const u8) ![]const u8 {
 }
 
 fn executeCommandInternal(self: *Shell, command: []const u8) !u8 {
-    // Try parsing with new parser first for pipes/redirects/logical operators
-    var cmd_parser = parser.Parser.init(command, self.allocator) catch {
-        // Parser init failed, use legacy path
-        return self.executeCommandLegacy(command);
+    var cmd_parser = parser.Parser.init(command, self.allocator) catch |err| {
+        try self.stdout().print("zish: parse error: {}\n", .{err});
+        return 1;
     };
     defer cmd_parser.deinit();
 
-    const ast_root = cmd_parser.parse() catch {
-        // Parsing failed, fall back to legacy implementation
-        return self.executeCommandLegacy(command);
-    };
-
-    // Successfully parsed, evaluate AST
-    return eval.evaluateAst(self, ast_root);
-}
-
-fn executeCommandLegacy(self: *Shell, command: []const u8) !u8 {
-    // Handle variable assignments (VAR=value) first
-    if (std.mem.indexOfScalar(u8, command, '=')) |eq_pos| {
-        const prefix = command[0..eq_pos];
-        if (std.mem.indexOfScalar(u8, prefix, ' ') == null) {
-            const name = prefix;
-            const value = command[eq_pos + 1 ..];
-
-            // Validate variable name
-            for (name) |c| {
-                if (!std.ascii.isAlphanumeric(c) and c != '_') {
-                    break; // Not valid, treat as command
-                }
-            } else {
-                // Valid assignment
-                const name_copy = try self.allocator.dupe(u8, name);
-                const value_copy = try self.allocator.dupe(u8, value);
-
-                if (self.variables.get(name_copy)) |old_value| {
-                    self.allocator.free(old_value);
-                }
-
-                try self.variables.put(name_copy, value_copy);
-                return 0;
-            }
-        }
-    }
-
-    // Tokenize command
-    var lex = try lexer.Lexer.init(command);
-    var tokens = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
-    defer {
-        for (tokens.items) |token_str| {
-            self.allocator.free(token_str);
-        }
-        tokens.deinit(self.allocator);
-    }
-
-    while (true) {
-        const token = try lex.nextToken();
-        if (token.ty == .Eof) break;
-        if (token.ty == .Word or token.ty == .String) {
-            const owned_token = try self.allocator.dupe(u8, token.value);
-            tokens.append(self.allocator, owned_token) catch {
-                self.allocator.free(owned_token);
-                return 1;
-            };
-        }
-    }
-
-    if (tokens.items.len == 0) return 0;
-
-    // Expand variables and globs for each token
-    var args = try std.ArrayList([]const u8).initCapacity(self.allocator, tokens.items.len * 2);
-    defer {
-        for (args.items) |arg| {
-            var is_original = false;
-            for (tokens.items) |tok| {
-                if (arg.ptr == tok.ptr) {
-                    is_original = true;
-                    break;
-                }
-            }
-            if (!is_original) self.allocator.free(arg);
-        }
-        args.deinit(self.allocator);
-    }
-
-    for (tokens.items) |token_val| {
-        // Expand variables first
-        const var_expanded = try self.expandVariables(token_val);
-        defer if (var_expanded.ptr != token_val.ptr) self.allocator.free(var_expanded);
-
-        // Check for glob patterns
-        const has_glob = for (var_expanded) |c| {
-            if (c == '*' or c == '?' or c == '[') break true;
-        } else false;
-
-        if (has_glob) {
-            const glob_results = glob.expandGlob(self.allocator, var_expanded) catch {
-                const copy = try self.allocator.dupe(u8, var_expanded);
-                try args.append(self.allocator, copy);
-                continue;
-            };
-            defer self.allocator.free(glob_results);
-
-            if (glob_results.len == 0) {
-                const copy = try self.allocator.dupe(u8, var_expanded);
-                try args.append(self.allocator, copy);
-            } else {
-                for (glob_results) |match| {
-                    try args.append(self.allocator, match);
-                }
-            }
-        } else {
-            const copy = try self.allocator.dupe(u8, var_expanded);
-            try args.append(self.allocator, copy);
-        }
-    }
-
-    if (args.items.len == 0) return 0;
-
-    const cmd_name = args.items[0];
-
-    // Handle builtins
-    if (std.mem.eql(u8, cmd_name, "exit")) {
-        self.running = false;
-        return 0;
-    }
-
-    if (std.mem.eql(u8, cmd_name, "echo")) {
-        for (args.items[1..], 0..) |arg, i| {
-            if (i > 0) try self.stdout().writeByte(' ');
-            try self.stdout().writeAll(arg);
-        }
-        try self.stdout().writeByte('\n');
-        return 0;
-    }
-
-    if (std.mem.eql(u8, cmd_name, "pwd")) {
-        var buf: [4096]u8 = undefined;
-        const cwd = try std.posix.getcwd(&buf);
-        try self.stdout().print("{s}\n", .{cwd});
-        return 0;
-    }
-
-    if (std.mem.eql(u8, cmd_name, "vimode")) {
-        self.vim_mode_enabled = !self.vim_mode_enabled;
-        if (self.vim_mode_enabled) {
-            try self.stdout().writeAll("Vi mode enabled\n");
-            self.vim_mode = .insert;
-        } else {
-            try self.stdout().writeAll("Vi mode disabled (Emacs-like editing)\n");
-        }
-        return 0;
-    }
-
-    if (std.mem.eql(u8, cmd_name, "cd")) {
-        const path = if (args.items.len > 1) args.items[1] else blk: {
-            const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch {
-                try self.stdout().writeAll("cd: could not get HOME\n");
-                return 1;
-            };
-            defer self.allocator.free(home);
-            break :blk try self.allocator.dupe(u8, home);
-        };
-        defer if (args.items.len == 1) self.allocator.free(path);
-
-        std.posix.chdir(path) catch |err| {
-            try self.stdout().print("cd: {s}: {}\n", .{ path, err });
-            return 1;
-        };
-        return 0;
-    }
-
-    if (std.mem.eql(u8, cmd_name, "history")) {
-        if (self.history) |h| {
-            const stats = h.getStats();
-            try self.stdout().print("history: {} entries ({} unique)\n", .{ stats.total, stats.unique });
-
-            var count: usize = 0;
-            var i = h.entries.items.len;
-            while (i > 0 and count < 10) {
-                i -= 1;
-                count += 1;
-                const entry = h.entries.items[i];
-                const cmd = h.getCommand(entry);
-                try self.stdout().print("  {}: {s} (exit: {})\n", .{ count, cmd, entry.exit_code });
-            }
-        } else {
-            try self.stdout().writeAll("history not available\n");
-        }
-        return 0;
-    }
-
-    if (std.mem.eql(u8, cmd_name, "search") and args.items.len > 1) {
-        if (self.history) |h| {
-            const query = args.items[1];
-            const matches = try h.fuzzySearch(query, self.allocator);
-            defer self.allocator.free(matches);
-
-            try self.stdout().print("fuzzy search results for '{s}':\n", .{query});
-            for (matches[0..@min(matches.len, 10)]) |match| {
-                const entry = h.entries.items[match.entry_index];
-                const cmd_str = h.getCommand(entry);
-                try self.stdout().print("  {}: {s}\n", .{ @as(u32, @intFromFloat(match.score)), cmd_str });
-            }
-        } else {
-            try self.stdout().writeAll("history not available\n");
-        }
-        return 0;
-    }
-
-    // Execute external command
-    // restore terminal to normal mode so child can handle signals properly
-    const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
-    if (is_tty) {
-        self.disableRawMode();
-    }
-    defer if (is_tty) {
-        self.enableRawMode() catch {};
-    };
-
-    var child = std.process.Child.init(args.items, self.allocator);
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.stdin_behavior = .Inherit;
-
-    const env_map = try std.process.getEnvMap(self.allocator);
-    child.env_map = &env_map;
-
-    // spawn child first, THEN ignore SIGINT in parent
-    // (child must not inherit SIG_IGN or it can't be interrupted)
-    _ = child.spawn() catch |err| {
-        try self.stdout().print("zish: {s}: {}\n", .{ cmd_name, err });
-        return 127;
-    };
-
-    // now ignore SIGINT in shell while child runs
-    var old_sigint: std.posix.Sigaction = undefined;
-    const ignore_action = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.mem.zeroes(std.posix.sigset_t),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
-
-    const term = child.wait() catch |err| {
-        try self.stdout().print("zish: wait failed: {}\n", .{err});
+    const ast_root = cmd_parser.parse() catch |err| {
+        try self.stdout().print("zish: parse error: {}\n", .{err});
         return 1;
     };
 
-    return switch (term) {
-        .Exited => |code| code,
-        else => 1,
-    };
+    return eval.evaluateAst(self, ast_root);
 }
 
 fn executeExternal(self: *Shell, command: []const u8) !u8 {

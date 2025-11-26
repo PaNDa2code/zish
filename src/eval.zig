@@ -35,6 +35,24 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     const cmd_name = try shell.expandVariables(raw_cmd);
     defer shell.allocator.free(cmd_name);
 
+    // alias expansion - substitute alias value for command name
+    if (shell.aliases.get(cmd_name)) |alias_value| {
+        // build new command: alias_value + remaining args
+        var new_cmd = std.ArrayListUnmanaged(u8){};
+        defer new_cmd.deinit(shell.allocator);
+
+        try new_cmd.appendSlice(shell.allocator, alias_value);
+
+        // append remaining arguments
+        for (node.children[1..]) |arg_node| {
+            try new_cmd.append(shell.allocator, ' ');
+            try new_cmd.appendSlice(shell.allocator, arg_node.value);
+        }
+
+        // recursively execute the expanded command
+        return shell.executeCommand(new_cmd.items);
+    }
+
     // expand glob patterns in arguments
     var expanded_args = try std.ArrayList([]const u8).initCapacity(shell.allocator, 16);
     defer {
@@ -533,26 +551,35 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     };
 
     // use cached path lookup for faster execution
-    var args_with_path = expanded_args.items;
     if (shell.lookupCommand(cmd_name)) |full_path| {
-        // replace command name with full path
-        expanded_args.items[0] = full_path;
-        args_with_path = expanded_args.items;
+        // free original and replace with duped cached path
+        shell.allocator.free(expanded_args.items[0]);
+        expanded_args.items[0] = shell.allocator.dupe(u8, full_path) catch cmd_name;
     }
 
-    var child = std.process.Child.init(args_with_path, shell.allocator);
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.stdin_behavior = .Inherit;
-
-    // spawn child first, THEN ignore SIGINT in parent
-    // (child must not inherit SIG_IGN or it can't be interrupted)
-    child.spawn() catch {
-        try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
-        return 127;
+    // direct fork/exec for performance
+    const pid = std.posix.fork() catch {
+        try shell.stdout().print("zish: fork failed\n", .{});
+        return 1;
     };
 
-    // now ignore SIGINT in shell while child runs
+    if (pid == 0) {
+        // child process - exec the command
+        // build null-terminated argv on stack
+        var argv_buf: [256]?[*:0]const u8 = undefined;
+        for (expanded_args.items, 0..) |arg, i| {
+            argv_buf[i] = @ptrCast(arg.ptr);
+        }
+        argv_buf[expanded_args.items.len] = null;
+        const argv = argv_buf[0..expanded_args.items.len :null];
+
+        std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {
+            // exec failed - exit (parent will report error)
+            std.posix.exit(127);
+        };
+    }
+
+    // parent - ignore SIGINT while child runs
     var old_sigint: std.posix.Sigaction = undefined;
     const ignore_action = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
@@ -562,16 +589,18 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
     defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
 
-    const term = child.wait() catch {
-        try shell.stdout().print("zish: wait failed\n", .{});
-        return 1;
-    };
-
-    return switch (term) {
-        .Exited => |code| code,
-        .Signal => |sig| @truncate(128 + sig),
-        else => 127,
-    };
+    // wait for child
+    const result = std.posix.waitpid(pid, 0);
+    if (std.posix.W.IFEXITED(result.status)) {
+        const code = std.posix.W.EXITSTATUS(result.status);
+        if (code == 127) {
+            try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
+        }
+        return code;
+    } else if (std.posix.W.IFSIGNALED(result.status)) {
+        return @truncate(128 + std.posix.W.TERMSIG(result.status));
+    }
+    return 127;
 }
 
 pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {

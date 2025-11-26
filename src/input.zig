@@ -76,10 +76,16 @@ pub const InsertAtPosition = enum {
     line_start,
 };
 
+pub const VisualModeType = enum {
+    char,  // v
+    line,  // V
+};
+
 pub const VimModeAction = union(enum) {
     toggle_enabled,
     toggle_mode,
     set_mode: VimMode,
+    enter_visual: VisualModeType,
 };
 
 // Main action type

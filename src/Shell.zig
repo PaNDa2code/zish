@@ -270,7 +270,7 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
     defer if (!std.mem.eql(u8, user, "?")) self.allocator.free(user);
 
     // get hostname
-    var hostname_buf: [64]u8 = undefined;
+    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const hostname = std.posix.gethostname(&hostname_buf) catch "localhost";
 
     // get cwd

@@ -30,12 +30,12 @@ benchmarks via `./bench.sh` (hyperfine):
 | for + functions: `for i in 1 2 3 4 5; do fn $i; done` | 2.5x | 2.9x |
 | nested loops: `for i in 1 2 3; do for j in a b c; ...` | 1.9x | 2.0x |
 | pipeline: `echo "3\n1\n2" \| sort \| head -2` | 1.8x | 2.1x |
-| command substitution: `x=$(echo hello)` | 1.1x | 1.1x |
+| command substitution: `x=$(echo hello)` | 5.3x | 5.5x |
 
 ## build
 
 ```
-zig build
+zig build --release=fast
 ./zig-out/bin/zish
 ```
 

@@ -760,9 +760,19 @@ pub const Vim = struct {
     // motion helpers
     fn moveWordForward(self: *Self, buf: *editor.EditBuffer) void {
         _ = self;
-        // skip current word
-        while (buf.cursor < buf.len and isWordChar(buf.text[buf.cursor])) {
-            _ = buf.moveRight();
+        if (buf.cursor >= buf.len) return;
+
+        const c = buf.text[buf.cursor];
+        if (isWordChar(c)) {
+            // skip current word chars
+            while (buf.cursor < buf.len and isWordChar(buf.text[buf.cursor])) {
+                _ = buf.moveRight();
+            }
+        } else if (isPunct(c)) {
+            // skip current punct chars
+            while (buf.cursor < buf.len and isPunct(buf.text[buf.cursor])) {
+                _ = buf.moveRight();
+            }
         }
         // skip whitespace
         while (buf.cursor < buf.len and isWhitespace(buf.text[buf.cursor])) {
@@ -784,13 +794,24 @@ pub const Vim = struct {
 
     fn moveWordBackward(self: *Self, buf: *editor.EditBuffer) void {
         _ = self;
+        if (buf.cursor == 0) return;
+
         // skip whitespace before
         while (buf.cursor > 0 and isWhitespace(buf.text[buf.cursor - 1])) {
             _ = buf.moveLeft();
         }
-        // skip word
-        while (buf.cursor > 0 and isWordChar(buf.text[buf.cursor - 1])) {
-            _ = buf.moveLeft();
+        if (buf.cursor == 0) return;
+
+        // skip word or punct
+        const c = buf.text[buf.cursor - 1];
+        if (isWordChar(c)) {
+            while (buf.cursor > 0 and isWordChar(buf.text[buf.cursor - 1])) {
+                _ = buf.moveLeft();
+            }
+        } else if (isPunct(c)) {
+            while (buf.cursor > 0 and isPunct(buf.text[buf.cursor - 1])) {
+                _ = buf.moveLeft();
+            }
         }
     }
 
@@ -806,12 +827,25 @@ pub const Vim = struct {
 
     fn moveWordEnd(self: *Self, buf: *editor.EditBuffer) void {
         _ = self;
+        if (buf.cursor >= buf.len) return;
+
         _ = buf.moveRight();
+        // skip whitespace
         while (buf.cursor < buf.len and isWhitespace(buf.text[buf.cursor])) {
             _ = buf.moveRight();
         }
-        while (buf.cursor < buf.len - 1 and isWordChar(buf.text[buf.cursor + 1])) {
-            _ = buf.moveRight();
+        if (buf.cursor >= buf.len) return;
+
+        // skip to end of word or punct
+        const c = buf.text[buf.cursor];
+        if (isWordChar(c)) {
+            while (buf.cursor < buf.len - 1 and isWordChar(buf.text[buf.cursor + 1])) {
+                _ = buf.moveRight();
+            }
+        } else if (isPunct(c)) {
+            while (buf.cursor < buf.len - 1 and isPunct(buf.text[buf.cursor + 1])) {
+                _ = buf.moveRight();
+            }
         }
     }
 
@@ -952,6 +986,10 @@ fn isWordChar(c: u8) bool {
         (c >= 'A' and c <= 'Z') or
         (c >= '0' and c <= '9') or
         c == '_';
+}
+
+fn isPunct(c: u8) bool {
+    return !isWordChar(c) and !isWhitespace(c);
 }
 
 fn isWhitespace(c: u8) bool {

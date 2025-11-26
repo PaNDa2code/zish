@@ -912,41 +912,48 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
     const cmd = self.edit_buf.slice();
 
     // Handle line up/down specially - may need history fallback
-    // In insert mode, always use history navigation for up/down
     switch (move_action) {
         .line_up => {
-            if (!self.vim_mode_enabled or self.vi.mode == .insert) {
-                // Insert mode: just do history navigation
-                try self.handleHistoryNavigation(.up);
-                try self.renderLine();
-            } else {
-                // Normal mode: line movement with history fallback
+            // Check if buffer has newlines - if so, try line navigation first
+            const has_newlines = std.mem.indexOfScalar(u8, cmd, '\n') != null;
+
+            if (has_newlines) {
+                // Try line navigation first
                 const result = self.findLinePosition(cmd, old_pos, true);
                 if (result.found) {
                     self.edit_buf.cursor = @intCast(result.pos);
-                                        try self.renderLine();
+                    try self.renderLine();
                 } else {
+                    // No line above, fall back to history
                     try self.handleHistoryNavigation(.up);
                     try self.renderLine();
                 }
+            } else {
+                // No newlines in buffer, just do history navigation
+                try self.handleHistoryNavigation(.up);
+                try self.renderLine();
             }
             return;
         },
         .line_down => {
-            if (!self.vim_mode_enabled or self.vi.mode == .insert) {
-                // Insert mode: just do history navigation
-                try self.handleHistoryNavigation(.down);
-                try self.renderLine();
-            } else {
-                // Normal mode: line movement with history fallback
+            // Check if buffer has newlines - if so, try line navigation first
+            const has_newlines = std.mem.indexOfScalar(u8, cmd, '\n') != null;
+
+            if (has_newlines) {
+                // Try line navigation first
                 const result = self.findLinePosition(cmd, old_pos, false);
                 if (result.found) {
                     self.edit_buf.cursor = @intCast(result.pos);
-                                        try self.renderLine();
+                    try self.renderLine();
                 } else {
+                    // No line below, fall back to history
                     try self.handleHistoryNavigation(.down);
                     try self.renderLine();
                 }
+            } else {
+                // No newlines in buffer, just do history navigation
+                try self.handleHistoryNavigation(.down);
+                try self.renderLine();
             }
             return;
         },

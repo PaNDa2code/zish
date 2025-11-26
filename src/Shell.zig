@@ -590,6 +590,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             completion_mod.exitCompletionMode(self);
             // print ^C like bash does
             try self.stdout().writeAll("^C\n");
+            try self.stdout().flush();
             // signal we're on a fresh line
             self.term_view.finishLine();
             self.displayed_cmd_lines = 1;
@@ -898,6 +899,7 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .exit_paste_mode => {
             self.paste_mode = false;
+            try self.stdout().flush(); // sync before render
             try self.renderLine();
         },
     }
@@ -970,6 +972,7 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
     
     // For multiline content, use renderLine for proper positioning
     if (std.mem.indexOfScalar(u8, cmd, '\n') != null) {
+        try self.stdout().flush(); // sync buffers before term_view render
         try self.renderLine();
     } else {
         const steps = if (new_pos > old_pos)

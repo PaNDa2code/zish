@@ -151,7 +151,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .functions = std.StringHashMap(*const ast.AstNode).init(allocator),
         // new modular editor
         .edit_buf = .{},
-        .term_view = editor.TermView.init(std.posix.STDOUT_FILENO),
+        .term_view = editor.TermView.init(std.posix.STDERR_FILENO),
         .vi = .{},
         .clipboard = clipboard_buffer,
         .clipboard_len = 0,
@@ -451,8 +451,9 @@ const CursorStyle = enum {
     }
 };
 
-fn setCursorStyle(self: *Shell, style: CursorStyle) !void {
-    try self.stdout().writeAll(style.escapeCode());
+fn setCursorStyle(_: *Shell, style: CursorStyle) !void {
+    // Write to stderr so it doesn't interfere with pipelines
+    _ = std.posix.write(std.posix.STDERR_FILENO, style.escapeCode()) catch {};
 }
 
 const TerminalSize = struct {

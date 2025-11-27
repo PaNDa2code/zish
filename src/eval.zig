@@ -3,6 +3,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
+const parser = @import("parser.zig");
 
 pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
     return switch (node.node_type) {
@@ -603,6 +604,49 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         return 1;
     }
 
+    // source / . builtin - execute file in current shell context
+    if (std.mem.eql(u8, cmd_name, "source") or std.mem.eql(u8, cmd_name, ".")) {
+        if (expanded_args.items.len < 2) {
+            try shell.stdout().print("{s}: filename argument required\n", .{cmd_name});
+            return 1;
+        }
+        const filename = expanded_args.items[1];
+
+        // Read file content
+        const file = std.fs.cwd().openFile(filename, .{}) catch {
+            try shell.stdout().print("{s}: {s}: No such file or directory\n", .{ cmd_name, filename });
+            return 1;
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(shell.allocator, 1024 * 1024) catch {
+            try shell.stdout().print("{s}: {s}: Error reading file\n", .{ cmd_name, filename });
+            return 1;
+        };
+        defer shell.allocator.free(content);
+
+        // Set positional parameters from remaining args
+        for (expanded_args.items[2..], 1..) |arg, i| {
+            var num_buf: [16]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
+            try setShellVar(shell, num_str, arg);
+        }
+
+        // Parse and execute the file content
+        var p = parser.Parser.init(content, shell.allocator) catch {
+            try shell.stdout().print("{s}: {s}: Parse error\n", .{ cmd_name, filename });
+            return 1;
+        };
+        defer p.deinit();
+
+        const tree = p.parse() catch {
+            try shell.stdout().print("{s}: {s}: Syntax error\n", .{ cmd_name, filename });
+            return 1;
+        };
+
+        return try evaluateAst(shell, tree);
+    }
+
     if (std.mem.eql(u8, cmd_name, "export")) {
         for (expanded_args.items[1..]) |arg| {
             if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
@@ -620,6 +664,63 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             } else {
                 try shell.stdout().print("export: {s}: not a valid identifier\n", .{arg});
                 return 1;
+            }
+        }
+        return 0;
+    }
+
+    // alias builtin
+    if (std.mem.eql(u8, cmd_name, "alias")) {
+        if (expanded_args.items.len == 1) {
+            // no args - list all aliases
+            var iter = shell.aliases.iterator();
+            while (iter.next()) |entry| {
+                try shell.stdout().print("alias {s}='{s}'\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            }
+            return 0;
+        }
+        for (expanded_args.items[1..]) |arg| {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
+                const name: []const u8 = arg[0..eq_pos];
+                var value: []const u8 = arg[eq_pos + 1 ..];
+
+                // remove quotes if present
+                if (value.len >= 2 and value[0] == '\'' and value[value.len - 1] == '\'') {
+                    value = value[1 .. value.len - 1];
+                } else if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+                    value = value[1 .. value.len - 1];
+                }
+
+                // store alias
+                const name_copy = try shell.allocator.dupe(u8, name);
+                const value_copy = try shell.allocator.dupe(u8, value);
+
+                // free old value if exists
+                if (shell.aliases.fetchRemove(name_copy)) |old| {
+                    shell.allocator.free(old.key);
+                    shell.allocator.free(old.value);
+                }
+
+                try shell.aliases.put(name_copy, value_copy);
+            } else {
+                // print specific alias
+                if (shell.aliases.get(arg)) |value| {
+                    try shell.stdout().print("alias {s}='{s}'\n", .{ arg, value });
+                } else {
+                    try shell.stdout().print("alias: {s}: not found\n", .{arg});
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // unalias builtin
+    if (std.mem.eql(u8, cmd_name, "unalias")) {
+        for (expanded_args.items[1..]) |arg| {
+            if (shell.aliases.fetchRemove(arg)) |old| {
+                shell.allocator.free(old.key);
+                shell.allocator.free(old.value);
             }
         }
         return 0;

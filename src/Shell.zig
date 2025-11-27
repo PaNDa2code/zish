@@ -178,7 +178,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
 
     // load config only for interactive mode
     if (load_config) {
-        shell.loadAliases() catch {}; // don't fail if no config file
+        shell.loadConfig() catch {}; // don't fail if no config file
     }
 
     return shell;
@@ -884,7 +884,27 @@ fn handleAction(self: *Shell, action: Action) !void {
                 .line_start => self.edit_buf.moveLineStart(),
                 .line_end => self.edit_buf.moveLineEnd(),
             }
-                        self.vi.mode = .insert;
+            self.vi.mode = .insert;
+            self.vim_mode = .insert;
+            try self.setCursorStyle(.bar);
+            try self.renderLine();
+        },
+
+        .open_line => |direction| {
+            switch (direction) {
+                .below => {
+                    // o - open line below: go to end of line, insert newline
+                    self.edit_buf.moveLineEnd();
+                    _ = self.edit_buf.insert('\n');
+                },
+                .above => {
+                    // O - open line above: go to start of line, insert newline, move back
+                    self.edit_buf.moveLineStart();
+                    _ = self.edit_buf.insert('\n');
+                    _ = self.edit_buf.moveLeft();
+                },
+            }
+            self.vi.mode = .insert;
             self.vim_mode = .insert;
             try self.setCursorStyle(.bar);
             try self.renderLine();
@@ -919,18 +939,21 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
             const has_newlines = std.mem.indexOfScalar(u8, cmd, '\n') != null;
 
             if (has_newlines) {
-                // Try line navigation first
-                const result = self.findLinePosition(cmd, old_pos, true);
-                if (result.found) {
-                    self.edit_buf.cursor = @intCast(result.pos);
+                // Check if we're on the first line (no newline before cursor)
+                const on_first_line = std.mem.lastIndexOfScalar(u8, cmd[0..old_pos], '\n') == null;
+                if (on_first_line) {
+                    // Already on first line, fall back to history
+                    self.vi.preferred_col_set = false; // reset preferred col on history nav
+                    try self.handleHistoryNavigation(.up);
                     try self.renderLine();
                 } else {
-                    // No line above, fall back to history
-                    try self.handleHistoryNavigation(.up);
+                    // Use vim's moveUp which tracks preferred column
+                    self.vi.moveUp(&self.edit_buf);
                     try self.renderLine();
                 }
             } else {
                 // No newlines in buffer, just do history navigation
+                self.vi.preferred_col_set = false;
                 try self.handleHistoryNavigation(.up);
                 try self.renderLine();
             }
@@ -941,18 +964,21 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
             const has_newlines = std.mem.indexOfScalar(u8, cmd, '\n') != null;
 
             if (has_newlines) {
-                // Try line navigation first
-                const result = self.findLinePosition(cmd, old_pos, false);
-                if (result.found) {
-                    self.edit_buf.cursor = @intCast(result.pos);
+                // Check if we're on the last line (no newline after cursor)
+                const on_last_line = std.mem.indexOfScalar(u8, cmd[old_pos..], '\n') == null;
+                if (on_last_line) {
+                    // Already on last line, fall back to history
+                    self.vi.preferred_col_set = false;
+                    try self.handleHistoryNavigation(.down);
                     try self.renderLine();
                 } else {
-                    // No line below, fall back to history
-                    try self.handleHistoryNavigation(.down);
+                    // Use vim's moveDown which tracks preferred column
+                    self.vi.moveDown(&self.edit_buf);
                     try self.renderLine();
                 }
             } else {
                 // No newlines in buffer, just do history navigation
+                self.vi.preferred_col_set = false;
                 try self.handleHistoryNavigation(.down);
                 try self.renderLine();
             }
@@ -960,6 +986,9 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
         },
         else => {},
     }
+
+    // Horizontal movement resets preferred column for j/k navigation
+    self.vi.preferred_col_set = false;
 
     // Calculate new position (clamped to valid range)
     const new_pos = switch (move_action) {
@@ -1253,6 +1282,9 @@ fn normalModeAction(char: u8) Action {
         'A' => .{ .insert_at_position = .line_end },
         'I' => .{ .insert_at_position = .line_start },
 
+        'o' => .{ .open_line = .below },
+        'O' => .{ .open_line = .above },
+
         'x' => .{ .delete = .char_under_cursor },
         'D' => .{ .delete = .to_line_end },
 
@@ -1533,7 +1565,7 @@ fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
     self.edit_buf.set(history_cmd);
     }
 
-fn loadAliases(self: *Shell) !void {
+fn loadConfig(self: *Shell) !void {
     // get home directory
     const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
     defer self.allocator.free(home);
@@ -1542,123 +1574,14 @@ fn loadAliases(self: *Shell) !void {
     const config_path = try std.fmt.allocPrint(self.allocator, "{s}/.zishrc", .{home});
     defer self.allocator.free(config_path);
 
-    // try to open the file
-    const file = std.fs.cwd().openFile(config_path, .{}) catch return;
-    defer file.close();
+    // check if file exists
+    std.fs.cwd().access(config_path, .{}) catch return;
 
-    // read file contents
-    const contents = try file.readToEndAlloc(self.allocator, 1024 * 1024); // max 1MB
-    defer self.allocator.free(contents);
+    // source the config file using the source builtin
+    const source_cmd = try std.fmt.allocPrint(self.allocator, "source {s}", .{config_path});
+    defer self.allocator.free(source_cmd);
 
-    // parse aliases and functions
-    var lines = std.mem.splitSequence(u8, contents, "\n");
-    var in_function = false;
-    var func_name: []const u8 = "";
-    var func_body = std.ArrayListUnmanaged(u8){};
-    defer func_body.deinit(self.allocator);
-    var brace_depth: u32 = 0;
-
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-
-        // if we're inside a function, collect body
-        if (in_function) {
-            // count braces (skip inside ${...})
-            var i: usize = 0;
-            while (i < line.len) {
-                if (i + 1 < line.len and line[i] == '$' and line[i + 1] == '{') {
-                    // skip to matching }
-                    i += 2;
-                    var param_depth: usize = 1;
-                    while (i < line.len and param_depth > 0) : (i += 1) {
-                        if (line[i] == '{') param_depth += 1;
-                        if (line[i] == '}') param_depth -= 1;
-                    }
-                    // i is now past the closing }, continue to next char
-                    continue;
-                }
-                if (line[i] == '{') brace_depth += 1;
-                if (line[i] == '}') {
-                    if (brace_depth > 0) brace_depth -= 1;
-                }
-                i += 1;
-            }
-
-            if (brace_depth == 0) {
-                // function ended, parse and store AST
-                var p = try parser.Parser.init(func_body.items, self.allocator);
-                defer p.deinit();
-                const body_ast = try p.parse();
-                // Clone AST for persistent storage
-                const cloned_ast = try body_ast.clone(self.allocator);
-                const name_copy = try self.allocator.dupe(u8, func_name);
-                try self.functions.put(name_copy, cloned_ast);
-                in_function = false;
-                func_body.clearRetainingCapacity();
-            } else {
-                // add line to function body
-                try func_body.appendSlice(self.allocator, line);
-                try func_body.append(self.allocator, '\n');
-            }
-            continue;
-        }
-
-        // skip empty lines and comments
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-
-        // look for function definitions: name() { or function name {
-        if (std.mem.indexOf(u8, trimmed, "() {")) |paren_pos| {
-            func_name = trimmed[0..paren_pos];
-            in_function = true;
-            brace_depth = 1;
-            // check if body starts on same line after {
-            if (std.mem.indexOf(u8, trimmed, "{")) |brace_pos| {
-                const after_brace = trimmed[brace_pos + 1 ..];
-                const after_trimmed = std.mem.trim(u8, after_brace, " \t");
-                if (after_trimmed.len > 0 and !std.mem.eql(u8, after_trimmed, "}")) {
-                    try func_body.appendSlice(self.allocator, after_trimmed);
-                    try func_body.append(self.allocator, '\n');
-                }
-                // check for closing brace on same line
-                for (after_brace) |c| {
-                    if (c == '}') brace_depth -= 1;
-                }
-                if (brace_depth == 0) {
-                    // Parse and store AST
-                    var p = try parser.Parser.init(func_body.items, self.allocator);
-                    defer p.deinit();
-                    const body_ast = try p.parse();
-                    const cloned_ast = try body_ast.clone(self.allocator);
-                    const name_copy = try self.allocator.dupe(u8, func_name);
-                    try self.functions.put(name_copy, cloned_ast);
-                    in_function = false;
-                    func_body.clearRetainingCapacity();
-                }
-            }
-            continue;
-        }
-
-        // look for alias definitions: alias name=value
-        if (std.mem.startsWith(u8, trimmed, "alias ")) {
-            const alias_def = trimmed[6..]; // skip "alias "
-            if (std.mem.indexOf(u8, alias_def, "=")) |eq_pos| {
-                const name = std.mem.trim(u8, alias_def[0..eq_pos], " \t");
-                var value = std.mem.trim(u8, alias_def[eq_pos + 1 ..], " \t");
-
-                // remove quotes if present
-                if (value.len >= 2 and value[0] == '\'' and value[value.len - 1] == '\'') {
-                    value = value[1 .. value.len - 1];
-                } else if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
-                    value = value[1 .. value.len - 1];
-                }
-
-                // store alias (make copies)
-                const name_copy = try self.allocator.dupe(u8, name);
-                const value_copy = try self.allocator.dupe(u8, value);
-                try self.aliases.put(name_copy, value_copy);
-            }
-        }
-    }
+    _ = self.executeCommand(source_cmd) catch {};
 }
 
 pub fn executeCommand(self: *Shell, command: []const u8) !u8 {

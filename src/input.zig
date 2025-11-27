@@ -76,6 +76,11 @@ pub const InsertAtPosition = enum {
     line_start,
 };
 
+pub const OpenLineDirection = enum {
+    below, // o - open line below
+    above, // O - open line above
+};
+
 pub const VisualModeType = enum {
     char,  // v
     line,  // V
@@ -109,6 +114,7 @@ pub const Action = union(enum) {
     yank: YankAction,
     paste: PasteAction,
     insert_at_position: InsertAtPosition,
+    open_line: OpenLineDirection,
     undo,
     toggle_bookmark,
     enter_paste_mode,
@@ -154,6 +160,9 @@ pub fn normalModeAction(char: u8) Action {
         'a' => .{ .insert_at_position = .after_cursor },
         'A' => .{ .insert_at_position = .line_end },
         'I' => .{ .insert_at_position = .line_start },
+
+        'o' => .{ .open_line = .below },
+        'O' => .{ .open_line = .above },
 
         'x' => .{ .delete = .char_under_cursor },
         'D' => .{ .delete = .to_line_end },

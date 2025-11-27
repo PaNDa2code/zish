@@ -108,9 +108,10 @@ pub const Lexer = struct {
     token_line: u32,
     token_col: u32,
 
-    // buffer for compound words (quotes concatenation)
-    buf: [types.MAX_TOKEN_LENGTH]u8,
+    // double-buffering for token values (prevents overwrite when peeking)
+    buf: [2][types.MAX_TOKEN_LENGTH]u8,
     buf_len: usize,
+    buf_idx: u1,  // alternates between 0 and 1
     use_buf: bool,  // true if we're building into buffer
 
     // nesting counters
@@ -132,6 +133,7 @@ pub const Lexer = struct {
             .token_col = 1,
             .buf = undefined,
             .buf_len = 0,
+            .buf_idx = 0,
             .use_buf = false,
             .paren_depth = 0,
             .brace_depth = 0,
@@ -161,8 +163,8 @@ pub const Lexer = struct {
     }
 
     fn bufAppend(self: *Self, c: u8) void {
-        if (self.buf_len < self.buf.len) {
-            self.buf[self.buf_len] = c;
+        if (self.buf_len < types.MAX_TOKEN_LENGTH) {
+            self.buf[self.buf_idx][self.buf_len] = c;
             self.buf_len += 1;
         }
     }
@@ -177,11 +179,13 @@ pub const Lexer = struct {
         self.token_col = self.column;
         self.buf_len = 0;
         self.use_buf = false;
+        // alternate buffer for next token (double-buffering)
+        self.buf_idx = 1 - self.buf_idx;
     }
 
     fn makeToken(self: *Self, ty: TokenType) Token {
         const value = if (self.use_buf)
-            self.buf[0..self.buf_len]
+            self.buf[self.buf_idx][0..self.buf_len]
         else
             self.input[self.token_start..self.pos];
 
@@ -769,7 +773,7 @@ pub const Lexer = struct {
         if (!self.use_buf) {
             // copy current token content to buffer
             const current = self.input[self.token_start..self.pos];
-            @memcpy(self.buf[0..current.len], current);
+            @memcpy(self.buf[self.buf_idx][0..current.len], current);
             self.buf_len = current.len;
             self.use_buf = true;
         }

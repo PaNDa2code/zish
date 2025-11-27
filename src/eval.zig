@@ -169,8 +169,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // expand command name (for ~/path/to/cmd)
-    const cmd_name = try shell.expandVariables(raw_cmd);
-    defer shell.allocator.free(cmd_name);
+    const cmd_name_result = try shell.expandVariablesZ(raw_cmd);
+    defer cmd_name_result.deinit(shell.allocator);
+    const cmd_name = cmd_name_result.slice;
 
     // alias expansion - substitute alias value for command name
     // but prevent infinite recursion for self-referencing aliases like "alias ls='ls --color=auto'"
@@ -233,11 +234,12 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         const arg = arg_node.value;
 
         // First expand variables (skip for single-quoted strings)
-        const var_expanded = if (arg_node.node_type == .string)
-            try shell.allocator.dupe(u8, arg)
+        const var_expanded_result = if (arg_node.node_type == .string)
+            Shell.ExpandResult{ .slice = arg, .owned = false }
         else
-            try shell.expandVariables(arg);
-        defer shell.allocator.free(var_expanded);
+            try shell.expandVariablesZ(arg);
+        defer var_expanded_result.deinit(shell.allocator);
+        const var_expanded = var_expanded_result.slice;
 
         // Then expand globs (only if pattern contains glob chars)
         if (glob.hasGlobChars(var_expanded)) {

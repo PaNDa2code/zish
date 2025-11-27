@@ -1279,7 +1279,7 @@ fn normalModeAction(char: u8) Action {
 
 fn escapeSequenceAction() !Action {
     const stdin_fd = std.posix.STDIN_FILENO;
-    var temp_buf: [3]u8 = undefined;
+    var temp_buf: [2]u8 = undefined;
 
     // Set non-blocking temporarily via system call
     const F_GETFL = 3;
@@ -1315,62 +1315,34 @@ fn escapeSequenceAction() !Action {
         'Z' => .{ .cycle_complete = .backward }, // Shift+Tab
         'H' => .{ .move_cursor = .to_line_start }, // Home key
         'F' => .{ .move_cursor = .to_line_end }, // End key
-        '1' => blk: {
-            // Ctrl+arrows, Home, End (ESC[1;5X or ESC[1~)
-            if (bytes_read >= 3) {
-                break :blk try handleExtendedEscapeSequence(temp_buf[2]);
-            }
-            break :blk try handleExtendedEscapeSequence(0);
-        },
-        '2' => blk: {
-            // Bracketed paste (ESC[200~ or ESC[201~)
-            if (bytes_read >= 3) {
-                break :blk try handleBracketedPaste(temp_buf[2], bytes_read);
-            }
-            break :blk .none;
-        },
-        '3' => blk: {
-            // Delete key (ESC[3~)
-            if (bytes_read >= 3 and temp_buf[2] == '~') {
-                break :blk .{ .delete = .char_under_cursor };
-            }
-            break :blk .none;
-        },
-        '4' => blk: {
-            // End key (ESC[4~) in some terminals
-            if (bytes_read >= 3 and temp_buf[2] == '~') {
-                break :blk .{ .move_cursor = .to_line_end };
-            }
-            break :blk .none;
-        },
-        '7' => blk: {
-            // Home key (ESC[7~) in some terminals
-            if (bytes_read >= 3 and temp_buf[2] == '~') {
-                break :blk .{ .move_cursor = .to_line_start };
-            }
-            break :blk .none;
-        },
-        '8' => blk: {
-            // End key (ESC[8~) in some terminals
-            if (bytes_read >= 3 and temp_buf[2] == '~') {
-                break :blk .{ .move_cursor = .to_line_end };
-            }
-            break :blk .none;
-        },
+        '1' => try handleExtendedEscapeSequence(stdin_fd, flags), // Ctrl+arrows, Home, End
+        '2' => try handleBracketedPaste(stdin_fd, flags), // Bracketed paste
+        '3' => try readTildeSequence(stdin_fd, flags, .{ .delete = .char_under_cursor }), // Delete key
+        '4' => try readTildeSequence(stdin_fd, flags, .{ .move_cursor = .to_line_end }), // End key
+        '7' => try readTildeSequence(stdin_fd, flags, .{ .move_cursor = .to_line_start }), // Home key
+        '8' => try readTildeSequence(stdin_fd, flags, .{ .move_cursor = .to_line_end }), // End key
         else => .none,
     };
 }
 
-fn handleExtendedEscapeSequence(third_byte: u8) !Action {
-    const stdin = std.fs.File.stdin();
-    var temp_buf: [2]u8 = undefined;
+fn readTildeSequence(stdin_fd: std.posix.fd_t, flags: usize, action: Action) !Action {
+    var buf: [1]u8 = undefined;
+    const result = std.posix.system.read(stdin_fd, &buf, 1);
+    if (result <= 0) return .none;
+    if (buf[0] == '~') return action;
+    _ = flags;
+    return .none;
+}
 
-    // check if we already have the semicolon
-    const semicolon = if (third_byte != 0) third_byte else blk: {
-        const semicolon_read = stdin.read(temp_buf[0..1]) catch return .none;
-        if (semicolon_read == 0) return .none;
-        break :blk temp_buf[0];
-    };
+fn handleExtendedEscapeSequence(stdin_fd: std.posix.fd_t, flags: usize) !Action {
+    var temp_buf: [1]u8 = undefined;
+    _ = flags;
+
+    // Read the next character (semicolon or tilde)
+    var result = std.posix.system.read(stdin_fd, &temp_buf, 1);
+    if (result <= 0) return .none;
+
+    const semicolon = temp_buf[0];
 
     // handle ESC[1~ (Home key in some terminals)
     if (semicolon == '~') {
@@ -1381,12 +1353,12 @@ fn handleExtendedEscapeSequence(third_byte: u8) !Action {
     if (semicolon != ';') return .none;
 
     // read modifier (5 = Ctrl)
-    const modifier_read = stdin.read(temp_buf[0..1]) catch return .none;
-    if (modifier_read == 0 or temp_buf[0] != '5') return .none;
+    result = std.posix.system.read(stdin_fd, &temp_buf, 1);
+    if (result <= 0 or temp_buf[0] != '5') return .none;
 
     // read direction key
-    const direction_read = stdin.read(temp_buf[0..1]) catch return .none;
-    if (direction_read == 0) return .none;
+    result = std.posix.system.read(stdin_fd, &temp_buf, 1);
+    if (result <= 0) return .none;
 
     return switch (temp_buf[0]) {
         'C' => .{ .move_cursor = .{ .word_forward = .word } },      // Ctrl+Right
@@ -1399,23 +1371,23 @@ fn handleExtendedEscapeSequence(third_byte: u8) !Action {
     };
 }
 
-fn handleBracketedPaste(third_byte: u8, bytes_read: usize) !Action {
-    const stdin = std.fs.File.stdin();
+fn handleBracketedPaste(stdin_fd: std.posix.fd_t, flags: usize) !Action {
+    _ = flags;
 
-    // We already have the third byte from the initial read
     // Sequence is ESC[200~ or ESC[201~
-    // We need to check: '0' (third_byte), then read '0' or '1', then '~'
+    // We've already read ESC[2, now read the rest: '0', '0'/'1', '~'
 
-    if (bytes_read < 3 or third_byte != '0') return .none;
+    var buf: [3]u8 = undefined;
+    const result = std.posix.system.read(stdin_fd, &buf, 3);
+    if (result < 3) return .none;
 
-    var buf: [2]u8 = undefined;
-    const read_count = stdin.read(&buf) catch return .none;
-    if (read_count < 2) return .none;
+    // First char should be '0'
+    if (buf[0] != '0') return .none;
+    // Third char should be '~'
+    if (buf[2] != '~') return .none;
 
     // Check for '0~' (paste start: 200~) or '1~' (paste end: 201~)
-    if (buf[1] != '~') return .none;
-
-    return switch (buf[0]) {
+    return switch (buf[1]) {
         '0' => .enter_paste_mode,
         '1' => .exit_paste_mode,
         else => .none,
@@ -1698,8 +1670,40 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     self.last_exit_code = exit_code;
     return exit_code;
 }
+/// Result of variable expansion - either borrowed (no alloc) or owned (needs free)
+pub const ExpandResult = struct {
+    slice: []const u8,
+    owned: bool,
+
+    pub fn deinit(self: ExpandResult, allocator: std.mem.Allocator) void {
+        if (self.owned) {
+            allocator.free(self.slice);
+        }
+    }
+};
+
+/// Expand variables without allocation when possible
+pub fn expandVariablesZ(self: *Shell, input: []const u8) !ExpandResult {
+    // Fast path: if no special chars, return slice directly (no alloc!)
+    const needs_expansion = blk: {
+        if (input.len > 0 and input[0] == '~') break :blk true;
+        for (input) |c| {
+            if (c == '$' or c == '`') break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (!needs_expansion) {
+        return .{ .slice = input, .owned = false };
+    }
+
+    // Need expansion - allocate
+    const expanded = try self.expandVariablesAlloc(input);
+    return .{ .slice = expanded, .owned = true };
+}
+
 pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
-    // Fast path: if no special chars, just duplicate the input
+    // Legacy API - always returns owned slice for compatibility
     const needs_expansion = blk: {
         if (input.len > 0 and input[0] == '~') break :blk true;
         for (input) |c| {
@@ -1711,6 +1715,11 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
     if (!needs_expansion) {
         return try self.allocator.dupe(u8, input);
     }
+
+    return self.expandVariablesAlloc(input);
+}
+
+fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 
     // Simple variable expansion - replace $VAR with variable value
     var result = try std.ArrayList(u8).initCapacity(self.allocator, input.len);
@@ -1896,7 +1905,7 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
                         // ${VAR:-default} or ${VAR-default}
                         if (use_default) {
                             // Recursively expand the default value
-                            const expanded_default = try self.expandVariables(default_value);
+                            const expanded_default = try self.expandVariablesAlloc(default_value);
                             defer self.allocator.free(expanded_default);
                             try result.appendSlice(self.allocator, expanded_default);
                         } else if (var_value) |v| {
@@ -1906,7 +1915,7 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
                     '+' => {
                         // ${VAR:+alternate} or ${VAR+alternate}
                         if (!use_default) {
-                            const expanded_alt = try self.expandVariables(default_value);
+                            const expanded_alt = try self.expandVariablesAlloc(default_value);
                             defer self.allocator.free(expanded_alt);
                             try result.appendSlice(self.allocator, expanded_alt);
                         }

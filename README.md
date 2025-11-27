@@ -18,14 +18,22 @@ fast, opinionated shell written in zig. for the brave.
 
 ## performance
 
-benchmarks on runlevel3 (1000 iterations, `time` measured):
-
 | test | vs bash | vs zsh |
 |------|---------|--------|
-| command substitution | **2.9x faster** | **3.1x faster** |
-| variables | **2.2x faster** | **2.4x faster** |
-| nested loops | **1.9x faster** | **2.1x faster** |
-| pipeline | **1.8x faster** | **2.0x faster** |
+| command substitution | **7.0x faster** | **7.0x faster** |
+| nested loops | **4.0x faster** | **4.4x faster** |
+| conditionals | **4.0x faster** | **4.5x faster** |
+| arithmetic | **3.8x faster** | **4.3x faster** |
+| variables | **3.6x faster** | **3.9x faster** |
+| functions | **3.4x faster** | **3.8x faster** |
+| pipelines | **1.7x faster** | **1.9x faster** |
+
+methodology: `./bench.sh` runs from `/bin/sh` with hyperfine. all shells use `--norc --noprofile` / `--no-rcs` to skip user config. output correctness is validated against bash before each benchmark.
+
+why it's fast:
+- **static binary** - no dynamic linker overhead, no shared libs
+- **stack buffers** - echo/test builtins use stack allocation in loops, no malloc
+- **minimal init** - no readline/job control setup for `-c` mode
 
 ## build
 

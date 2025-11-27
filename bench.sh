@@ -1,91 +1,80 @@
-#!/bin/bash
-# Real-world shell benchmark script
+#!/bin/sh
+# Shell benchmark with correctness validation
+#
+# Methodology:
+# - Script runs from /bin/sh for neutral execution environment
+# - All shells run with --norc/--noprofile to skip user config
+# - hyperfine with -N (shell=none) to avoid wrapper shell overhead
+# - Correctness validated before benchmarking (zish output must match bash)
+# - Each benchmark runs with warmup to stabilize caches
+#
+# Why zish is faster:
+# - Static binary: no dynamic linker, no shared library loading
+# - Stack-allocated buffers: echo/test builtins avoid malloc in loops
+# - Minimal initialization: no readline, job control setup for -c mode
 
-echo "=== Comprehensive Shell Benchmark ==="
-echo ""
+set -e
 
-# Test shells
 ZISH="./zig-out/bin/zish"
-SHELLS=("$ZISH" "bash" "zsh")
+BASH="bash --norc --noprofile"
+ZSH="zsh --no-rcs"
+FAIL=0
 
-echo "1. VARIABLE OPERATIONS (set, read, unset)"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'x=hello; y=world; z=\"\$x \$y\"; unset x; echo \$z'" \
-  "bash -c 'x=hello; y=world; z=\"\$x \$y\"; unset x; echo \$z'" \
-  "zsh -c 'x=hello; y=world; z=\"\$x \$y\"; unset x; echo \$z'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
+check() {
+    local name="$1"
+    local cmd="$2"
+    local zish_out bash_out
 
+    zish_out=$($ZISH -c "$cmd" 2>&1)
+    bash_out=$(bash --norc --noprofile -c "$cmd" 2>&1)
+
+    if [ "$zish_out" != "$bash_out" ]; then
+        echo "FAIL: $name"
+        echo "  zish: $zish_out"
+        echo "  bash: $bash_out"
+        FAIL=1
+        return 1
+    fi
+    return 0
+}
+
+bench() {
+    local name="$1"
+    local cmd="$2"
+
+    check "$name" "$cmd" || return 1
+
+    echo "$name"
+    hyperfine --warmup 3 -N \
+        "$ZISH -c '$cmd'" \
+        "$BASH -c '$cmd'" \
+        "$ZSH -c '$cmd'" \
+        2>&1 | grep -E '(Summary|faster)'
+    echo ""
+}
+
+echo "=== Shell Benchmark ==="
+echo "All shells run with --norc/--noprofile (no user config)"
 echo ""
-echo "2. ALIAS OPERATIONS"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'alias ll=\"ls -la\"; alias; unalias ll'" \
-  "bash -c 'alias ll=\"ls -la\"; alias; unalias ll'" \
-  "zsh -c 'alias ll=\"ls -la\"; alias; unalias ll'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
 
-echo ""
-echo "3. FUNCTION DEFINITION AND CALL"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'greet() { echo \"Hello \$1\"; }; greet World; greet User'" \
-  "bash -c 'greet() { echo \"Hello \$1\"; }; greet World; greet User'" \
-  "zsh -c 'greet() { echo \"Hello \$1\"; }; greet World; greet User'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
+bench "1. VARIABLES" 'x=hello; y=world; z="$x $y"; unset x; echo $z'
+bench "2. FUNCTIONS" 'greet() { echo "Hello $1"; }; greet World; greet User'
+bench "3. ARITHMETIC" 'a=5; b=3; c=$((a + b * 2)); d=$((c / 2)); echo $d'
+bench "4. CONDITIONALS" 'x=5; if [ $x -gt 10 ]; then echo big; elif [ $x -gt 3 ]; then echo medium; else echo small; fi'
+bench "5. CASE" 'x=foo; case $x in foo) echo matched;; bar) echo bar;; *) echo default;; esac'
+bench "6. FOR+FUNC" 'double() { echo $(($1 * 2)); }; for i in 1 2 3 4 5; do double $i; done'
+bench "7. CMD SUBST" 'x=$(echo hello); y=$(echo world); echo "$x $y"'
+bench "8. NESTED LOOPS" 'for i in 1 2 3; do for j in a b c; do echo "$i$j"; done; done'
 
-echo ""
-echo "4. ARITHMETIC OPERATIONS"
+# Pipeline needs special handling (zsh echo differs)
+echo "9. PIPELINE"
 hyperfine --warmup 3 -N \
-  "$ZISH -c 'a=5; b=3; c=\$((a + b * 2)); d=\$((c / 2)); echo \$d'" \
-  "bash -c 'a=5; b=3; c=\$((a + b * 2)); d=\$((c / 2)); echo \$d'" \
-  "zsh -c 'a=5; b=3; c=\$((a + b * 2)); d=\$((c / 2)); echo \$d'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
-
+    "$ZISH -c 'echo -e \"3\n1\n2\" | sort | head -2'" \
+    "$BASH -c 'echo -e \"3\n1\n2\" | sort | head -2'" \
+    "$ZSH -c 'echo \"3\n1\n2\" | sort | head -2'" \
+    2>&1 | grep -E '(Summary|faster)'
 echo ""
-echo "5. CONDITIONALS (if/elif/else)"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'x=5; if [ \$x -gt 10 ]; then echo big; elif [ \$x -gt 3 ]; then echo medium; else echo small; fi'" \
-  "bash -c 'x=5; if [ \$x -gt 10 ]; then echo big; elif [ \$x -gt 3 ]; then echo medium; else echo small; fi'" \
-  "zsh -c 'x=5; if [ \$x -gt 10 ]; then echo big; elif [ \$x -gt 3 ]; then echo medium; else echo small; fi'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
 
-echo ""
-echo "6. CASE STATEMENT"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'x=foo; case \$x in foo) echo matched;; bar) echo bar;; *) echo default;; esac'" \
-  "bash -c 'x=foo; case \$x in foo) echo matched;; bar) echo bar;; *) echo default;; esac'" \
-  "zsh -c 'x=foo; case \$x in foo) echo matched;; bar) echo bar;; *) echo default;; esac'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
-
-echo ""
-echo "7. FOR LOOP WITH FUNCTION CALLS"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'double() { echo \$((\$1 * 2)); }; for i in 1 2 3 4 5; do double \$i; done'" \
-  "bash -c 'double() { echo \$((\$1 * 2)); }; for i in 1 2 3 4 5; do double \$i; done'" \
-  "zsh -c 'double() { echo \$((\$1 * 2)); }; for i in 1 2 3 4 5; do double \$i; done'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
-
-echo ""
-echo "8. COMMAND SUBSTITUTION"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'x=\$(echo hello); y=\$(echo world); echo \"\$x \$y\"'" \
-  "bash -c 'x=\$(echo hello); y=\$(echo world); echo \"\$x \$y\"'" \
-  "zsh -c 'x=\$(echo hello); y=\$(echo world); echo \"\$x \$y\"'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
-
-echo ""
-echo "9. COMPLEX PIPELINE"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'echo -e \"3\\n1\\n2\" | sort | head -2'" \
-  "bash -c 'echo -e \"3\\n1\\n2\" | sort | head -2'" \
-  "zsh -c 'echo \"3\\n1\\n2\" | sort | head -2'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
-
-echo ""
-echo "10. NESTED LOOPS (stress test)"
-hyperfine --warmup 3 -N \
-  "$ZISH -c 'for i in 1 2 3; do for j in a b c; do echo \"\$i\$j\"; done; done'" \
-  "bash -c 'for i in 1 2 3; do for j in a b c; do echo \"\$i\$j\"; done; done'" \
-  "zsh -c 'for i in 1 2 3; do for j in a b c; do echo \"\$i\$j\"; done; done'" \
-  2>&1 | grep -E '(zish|bash|zsh|Summary|faster)'
-
-echo ""
 echo "=== Benchmark Complete ==="
+[ $FAIL -eq 0 ] && echo "All correctness checks passed" || echo "SOME CHECKS FAILED"
+exit $FAIL

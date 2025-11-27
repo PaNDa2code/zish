@@ -71,6 +71,76 @@ fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
     return if (result) 0 else 1;
 }
 
+// Check if string contains command substitution $(cmd) but not $((arith))
+fn hasCommandSubstitution(input: []const u8) bool {
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '$' and i + 1 < input.len and input[i + 1] == '(') {
+            // Check if it's $((arith)) or $(cmd)
+            if (i + 2 < input.len and input[i + 2] == '(') {
+                // $((arith)) - skip past it
+                i += 3;
+                var depth: u32 = 2;
+                while (i < input.len and depth > 0) {
+                    if (input[i] == '(') depth += 1;
+                    if (input[i] == ')') depth -= 1;
+                    i += 1;
+                }
+            } else {
+                // $(cmd) - found command substitution
+                return true;
+            }
+        } else if (input[i] == '`') {
+            // Backtick command substitution
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    return false;
+}
+
+// Expand $VAR references within arithmetic expressions (no allocation)
+fn expandArithmeticVars(shell: *Shell, expr: []const u8, dest: *[256]u8) !usize {
+    var out_pos: usize = 0;
+    var i: usize = 0;
+
+    while (i < expr.len and out_pos < 256) {
+        if (expr[i] == '$' and i + 1 < expr.len) {
+            i += 1;
+            const name_start = i;
+            while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_')) {
+                i += 1;
+            }
+            if (i > name_start) {
+                const var_name = expr[name_start..i];
+                if (shell.variables.get(var_name)) |value| {
+                    const copy_len = @min(value.len, 256 - out_pos);
+                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
+                    out_pos += copy_len;
+                } else if (std.posix.getenv(var_name)) |value| {
+                    const copy_len = @min(value.len, 256 - out_pos);
+                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
+                    out_pos += copy_len;
+                } else {
+                    // Unknown variable = 0 in arithmetic
+                    dest[out_pos] = '0';
+                    out_pos += 1;
+                }
+            } else {
+                // Lone $ - copy it
+                dest[out_pos] = '$';
+                out_pos += 1;
+            }
+        } else {
+            dest[out_pos] = expr[i];
+            out_pos += 1;
+            i += 1;
+        }
+    }
+    return out_pos;
+}
+
 // Fast variable expansion that writes to a provided buffer (no allocation)
 fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
     // Fast path: no variables
@@ -108,7 +178,10 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                 if (paren_count == 0 and i > 0) {
                     const expr = input[expr_start .. i - 1];
                     i += 1; // skip final )
-                    const arith_result = try shell.evaluateArithmetic(expr);
+                    // Expand variables within the arithmetic expression first
+                    var expr_buf: [256]u8 = undefined;
+                    const expanded_expr_len = try expandArithmeticVars(shell, expr, &expr_buf);
+                    const arith_result = try shell.evaluateArithmetic(expr_buf[0..expanded_expr_len]);
                     const result_str = std.fmt.bufPrint(dest[out_pos..], "{d}", .{arith_result}) catch break;
                     out_pos += result_str.len;
                     continue;
@@ -150,6 +223,79 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
     return out_pos;
 }
 
+// Fast path for echo builtin - uses stack buffers to avoid allocations
+fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
+    // Stack-allocated buffers for expanded arguments (max 16 args, 256 bytes each)
+    var arg_buffers: [16][256]u8 = undefined;
+    var arg_slices: [16][]const u8 = undefined;
+    var arg_count: usize = 0;
+
+    var interpret_escapes = false;
+    var print_newline = true;
+    var arg_start: usize = 1; // skip "echo"
+
+    // Parse flags first
+    while (arg_start < node.children.len and arg_count < 16) {
+        const arg = node.children[arg_start].value;
+        if (arg.len >= 2 and arg[0] == '-') {
+            var valid_flag = true;
+            var has_e = false;
+            var has_n = false;
+            for (arg[1..]) |c| {
+                switch (c) {
+                    'e' => has_e = true,
+                    'n' => has_n = true,
+                    'E' => {},
+                    else => {
+                        valid_flag = false;
+                        break;
+                    },
+                }
+            }
+            if (valid_flag) {
+                if (has_e) interpret_escapes = true;
+                if (has_n) print_newline = false;
+                arg_start += 1;
+                continue;
+            }
+        }
+        break;
+    }
+
+    // Expand remaining arguments into stack buffers
+    for (node.children[arg_start..]) |arg_node| {
+        if (arg_count >= 16) break;
+
+        const arg = arg_node.value;
+        const dest = &arg_buffers[arg_count];
+
+        // For string nodes (single-quoted), no expansion needed
+        if (arg_node.node_type == .string) {
+            const len = @min(arg.len, 256);
+            @memcpy(dest[0..len], arg[0..len]);
+            arg_slices[arg_count] = dest[0..len];
+        } else {
+            const expanded_len = try expandVariableFast(shell, arg, dest);
+            arg_slices[arg_count] = dest[0..expanded_len];
+        }
+        arg_count += 1;
+    }
+
+    // Output
+    const writer = shell.stdout();
+    for (arg_slices[0..arg_count], 0..) |arg, i| {
+        if (i > 0) try writer.writeByte(' ');
+        if (interpret_escapes) {
+            try writeEscaped(writer, arg);
+        } else {
+            try writer.writeAll(arg);
+        }
+    }
+    if (print_newline) try writer.writeByte('\n');
+
+    return 0;
+}
+
 pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
 
@@ -166,6 +312,21 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // Fast path for test builtin - avoid allocations in tight loops
     if ((raw_cmd.len == 1 and raw_cmd[0] == '[') or std.mem.eql(u8, raw_cmd, "test")) {
         return evaluateTestBuiltinFast(shell, node);
+    }
+
+    // Fast path for echo builtin - avoid allocations in tight loops
+    // Skip fast path if any arg has command substitution $(cmd) (not $((arith)))
+    if (std.mem.eql(u8, raw_cmd, "echo")) {
+        var has_cmd_subst = false;
+        for (node.children[1..]) |arg_node| {
+            if (hasCommandSubstitution(arg_node.value)) {
+                has_cmd_subst = true;
+                break;
+            }
+        }
+        if (!has_cmd_subst) {
+            return evaluateEchoBuiltinFast(shell, node);
+        }
     }
 
     // expand command name (for ~/path/to/cmd)

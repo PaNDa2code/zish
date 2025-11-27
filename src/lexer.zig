@@ -92,6 +92,8 @@ const State = enum {
     rbracket,
     // fd redirect (e.g., 2>)
     fd_num,
+    // URL (e.g., https://example.com?a=1&b=2)
+    url,
 };
 
 pub const Lexer = struct {
@@ -364,6 +366,20 @@ pub const Lexer = struct {
                     }
 
                     const ch = c.?;
+
+                    // Check for URL pattern: if we see :// transition to URL mode
+                    if (ch == ':' and self.peekN(1) == @as(u8, '/') and self.peekN(2) == @as(u8, '/')) {
+                        self.switchToBuf();
+                        self.bufAppend(':');
+                        _ = self.advance();
+                        self.bufAppend('/');
+                        _ = self.advance();
+                        self.bufAppend('/');
+                        _ = self.advance();
+                        self.state = .url;
+                        continue;
+                    }
+
                     switch (ch) {
                         // quotes continue the word
                         '\'' => {
@@ -718,6 +734,26 @@ pub const Lexer = struct {
                         // don't emit comment as token, just skip
                         continue;
                     }
+                    _ = self.advance();
+                },
+
+                .url => {
+                    // URL mode: allow &, ?, =, etc. until whitespace or shell-specific operators
+                    if (c == null) {
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
+                    const ch = c.?;
+                    // End URL on whitespace or shell operators that wouldn't appear in URLs
+                    if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '|' or
+                        ch == ';' or ch == '(' or ch == ')' or ch == '<' or
+                        ch == '>' or ch == '`' or ch == '"' or ch == '\'')
+                    {
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
+                    // Allow all other chars including & ? = # etc.
+                    self.bufAppend(ch);
                     _ = self.advance();
                 },
 

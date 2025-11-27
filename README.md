@@ -18,19 +18,14 @@ fast, opinionated shell written in zig. for the brave.
 
 ## performance
 
-benchmarks via `./bench.sh` (hyperfine):
+benchmarks on runlevel3 (1000 iterations, `time` measured):
 
 | test | vs bash | vs zsh |
 |------|---------|--------|
-| variables: `x=hello; y=world; z="$x $y"; unset x` | 3.2x | 3.6x |
-| functions: `greet() { echo "Hello $1"; }; greet World` | 3.3x | 3.8x |
-| arithmetic: `a=5; b=3; c=$((a + b * 2))` | 3.5x | 3.8x |
-| conditionals: `if [ $x -gt 10 ]; then ... fi` | 3.5x | 3.9x |
-| case: `case $x in foo) echo matched;; esac` | 3.5x | 4.0x |
-| for + functions: `for i in 1 2 3 4 5; do fn $i; done` | 2.5x | 2.9x |
-| nested loops: `for i in 1 2 3; do for j in a b c; ...` | 1.9x | 2.0x |
-| pipeline: `echo "3\n1\n2" \| sort \| head -2` | 1.8x | 2.1x |
-| command substitution: `x=$(echo hello)` | 5.3x | 5.5x |
+| command substitution | **2.9x faster** | **3.1x faster** |
+| variables | **2.2x faster** | **2.4x faster** |
+| nested loops | **1.9x faster** | **2.1x faster** |
+| pipeline | **1.8x faster** | **2.0x faster** |
 
 ## build
 

@@ -76,7 +76,7 @@ pub fn main() void {
 
         // Flush stdout buffer before exit
         shell_instance.stdout().flush() catch {};
-        std.process.exit(exit_code);
+        std.posix.exit(exit_code);
     } else if (res.positionals.len > 0 and res.positionals[0].len > 0) {
         // script file mode
         const script_path = res.positionals[0][0];

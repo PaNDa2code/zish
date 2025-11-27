@@ -21,6 +21,7 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
         .test_expression => evaluateTest(shell, node),
         .function_def => evaluateFunctionDef(shell, node),
         .case_statement => evaluateCase(shell, node),
+        .background => evaluateBackground(shell, node),
         else => {
             try shell.stdout().writeAll("unsupported AST node type\n");
             return 1;
@@ -745,6 +746,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // Normal context: fork/exec for external command
+    // Flush stdout buffer before forking
+    shell.stdout().flush() catch {};
+
     const pid = std.posix.fork() catch {
         try shell.stdout().print("zish: fork failed\n", .{});
         return 1;
@@ -882,6 +886,10 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
             }
         }
     }
+
+    // Flush stdout buffer before forking to prevent buffered data from
+    // being written to pipes (causing jq parse errors, etc.)
+    shell.stdout().flush() catch {};
 
     for (node.children, 0..) |child, i| {
         const pid = try std.posix.fork();
@@ -1275,6 +1283,35 @@ fn setForVariable(shell: *Shell, name: []const u8, value: []const u8) !void {
 pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
     return evaluateAst(shell, node.children[0]);
+}
+
+pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
+    if (node.children.len == 0) return 1;
+
+    const command = node.children[0];
+
+    // Flush stdout buffer before forking
+    shell.stdout().flush() catch {};
+
+    // Fork to run command in background
+    const pid = std.posix.fork() catch {
+        try shell.stdout().writeAll("zish: fork failed\n");
+        return 1;
+    };
+
+    if (pid == 0) {
+        // Child process: run the command
+        // After fork, the parent's allocator (GPA) may not work correctly.
+        // Switch to page_allocator which is fork-safe.
+        shell.allocator = std.heap.page_allocator;
+        const status = evaluateAst(shell, command) catch 127;
+        shell.stdout().flush() catch {};
+        std.posix.exit(status);
+    }
+
+    // Parent: print background job info and return immediately
+    shell.stdout().print("[1] {d}\n", .{pid}) catch {};
+    return 0;
 }
 
 pub fn evaluateCase(shell: *Shell, node: *const ast.AstNode) !u8 {

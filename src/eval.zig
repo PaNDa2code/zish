@@ -1054,11 +1054,10 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     argv_buf[expanded_args.items.len] = null;
     const argv = argv_buf[0..expanded_args.items.len :null];
 
-    // Build environment with shell variables (PATH, etc.)
-    const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
-
     // In pipeline context, exec directly (we're already forked)
     if (shell.in_pipeline) {
+        // Build environment in child process (after fork, safe from parent interference)
+        const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
         std.posix.execvpeZ(argv[0].?, argv, envp) catch {
             std.posix.exit(127);
         };
@@ -1075,6 +1074,8 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     };
 
     if (pid == 0) {
+        // Build environment in child process (after fork, safe from parent interference)
+        const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
         std.posix.execvpeZ(argv[0].?, argv, envp) catch {
             std.posix.exit(127);
         };

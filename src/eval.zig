@@ -5,6 +5,59 @@ const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
 const parser = @import("parser.zig");
 
+// Build environment array merging system env with shell variables
+// Shell variables override system environment
+fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
+    // Count total entries needed
+    var count: usize = 0;
+
+    // Count system env vars (excluding ones we'll override)
+    for (std.os.environ) |entry| {
+        const entry_slice = std.mem.sliceTo(entry, 0);
+        const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
+        const name = entry_slice[0..eq_pos];
+        // Skip if shell has override
+        if (shell.variables.contains(name)) continue;
+        count += 1;
+    }
+
+    // Add shell variables
+    count += shell.variables.count();
+
+    // Allocate array (count + 1 for null terminator)
+    var env_ptrs = try shell.allocator.alloc(?[*:0]const u8, count + 1);
+
+    var idx: usize = 0;
+
+    // Add system env vars (not overridden)
+    for (std.os.environ) |entry| {
+        const entry_slice = std.mem.sliceTo(entry, 0);
+        const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
+        const name = entry_slice[0..eq_pos];
+        if (shell.variables.contains(name)) continue;
+        env_ptrs[idx] = entry;
+        idx += 1;
+    }
+
+    // Add shell variables
+    var var_iter = shell.variables.iterator();
+    while (var_iter.next()) |kv| {
+        // Build "NAME=value\0" string (leaked - child exits after exec)
+        const name = kv.key_ptr.*;
+        const value = kv.value_ptr.*;
+        const env_str = try shell.allocator.alloc(u8, name.len + 1 + value.len + 1);
+        @memcpy(env_str[0..name.len], name);
+        env_str[name.len] = '=';
+        @memcpy(env_str[name.len + 1 ..][0..value.len], value);
+        env_str[name.len + 1 + value.len] = 0;
+        env_ptrs[idx] = @ptrCast(env_str.ptr);
+        idx += 1;
+    }
+
+    env_ptrs[idx] = null;
+    return @ptrCast(env_ptrs.ptr);
+}
+
 pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
     return switch (node.node_type) {
         .command => evaluateCommand(shell, node),
@@ -1001,9 +1054,12 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     argv_buf[expanded_args.items.len] = null;
     const argv = argv_buf[0..expanded_args.items.len :null];
 
+    // Build environment with shell variables (PATH, etc.)
+    const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
+
     // In pipeline context, exec directly (we're already forked)
     if (shell.in_pipeline) {
-        std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {
+        std.posix.execvpeZ(argv[0].?, argv, envp) catch {
             std.posix.exit(127);
         };
         unreachable;
@@ -1019,7 +1075,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     };
 
     if (pid == 0) {
-        std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {
+        std.posix.execvpeZ(argv[0].?, argv, envp) catch {
             std.posix.exit(127);
         };
     }
@@ -1096,7 +1152,8 @@ fn execSimpleCommand(shell: *Shell, node: *const ast.AstNode) void {
     argv_buf[arg_count] = null;
 
     const argv = argv_buf[0..arg_count :null];
-    std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {};
+    const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
+    std.posix.execvpeZ(argv[0].?, argv, envp) catch {};
     std.posix.exit(127);
 }
 

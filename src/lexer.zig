@@ -722,9 +722,23 @@ pub const Lexer = struct {
                     }
                     const ch = c.?;
                     if (ch == '\n') {
-                        // line continuation - skip and continue
+                        // line continuation - skip backslash-newline
                         _ = self.advance();
-                        self.state = if (self.use_buf or self.pos > self.token_start + 1) .word else .normal;
+                        if (self.use_buf) {
+                            // already building a token in buffer, continue in word mode
+                            self.state = .word;
+                        } else if (self.pos > self.token_start + 2) {
+                            // had content before backslash, need to use buffer
+                            // copy content without the backslash
+                            const content = self.input[self.token_start .. self.pos - 2];
+                            @memcpy(self.buf[self.buf_idx][0..content.len], content);
+                            self.buf_len = content.len;
+                            self.use_buf = true;
+                            self.state = .word;
+                        } else {
+                            // backslash-newline at start, just skip and restart
+                            self.state = .normal;
+                        }
                     } else {
                         if (self.use_buf) self.bufAppend(ch);
                         self.state = .word;

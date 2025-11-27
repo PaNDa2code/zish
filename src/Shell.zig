@@ -346,7 +346,8 @@ pub fn lookupCommand(self: *Shell, cmd_name: []const u8) ?[]const u8 {
 }
 
 fn searchPath(self: *Shell, cmd_name: []const u8) ?[]const u8 {
-    const path_env = std.posix.getenv("PATH") orelse return null;
+    // Check shell variables first (for exported PATH), then fall back to system env
+    const path_env = self.variables.get("PATH") orelse (std.posix.getenv("PATH") orelse return null);
 
     var path_iter = std.mem.splitScalar(u8, path_env, ':');
     while (path_iter.next()) |dir| {
@@ -720,6 +721,20 @@ fn handleAction(self: *Shell, action: Action) !void {
                 completion_mod.exitCompletionMode(self);
 
                 const command = std.mem.trim(u8, self.edit_buf.slice(), " \t\n\r");
+
+                // Check for line continuation (trailing backslash)
+                if (command.len > 0 and command[command.len - 1] == '\\') {
+                    // Check it's not an escaped backslash (\\)
+                    const is_escaped = command.len >= 2 and command[command.len - 2] == '\\';
+                    if (!is_escaped) {
+                        // Line continuation - insert newline and continue editing
+                        _ = self.edit_buf.insert('\n');
+                        try self.stdout().writeByte('\n');
+                        try self.stdout().writeAll("> ");
+                        try self.stdout().flush();
+                        return;
+                    }
+                }
 
                 try self.stdout().writeByte('\n');
                 try self.stdout().flush();

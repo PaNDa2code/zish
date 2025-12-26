@@ -19,9 +19,18 @@ pub fn expandGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]const 
     }
 }
 
-pub fn hasGlobChars(pattern: []const u8) bool {
+// Glob character check using lookup table - SectorLambda-inspired
+const glob_char_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    table['*'] = true;
+    table['?'] = true;
+    table['['] = true;
+    break :blk table;
+};
+
+pub inline fn hasGlobChars(pattern: []const u8) bool {
     for (pattern) |c| {
-        if (c == '*' or c == '?' or c == '[') return true;
+        if (glob_char_table[c]) return true;
     }
     return false;
 }

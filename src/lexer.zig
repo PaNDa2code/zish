@@ -794,28 +794,71 @@ pub const Lexer = struct {
     }
 };
 
-fn isOperator(c: u8) bool {
-    return switch (c) {
-        ' ', '\t', '\n', '|', '&', ';', '(', ')', '<', '>', '{', '}' => true,
-        else => false,
-    };
+// Operator check using lookup table - faster than switch for hot path
+// Inspired by SectorLambda's minimal instruction approach
+const operator_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    for ([_]u8{ ' ', '\t', '\n', '|', '&', ';', '(', ')', '<', '>', '{', '}' }) |c| {
+        table[c] = true;
+    }
+    break :blk table;
+};
+
+inline fn isOperator(c: u8) bool {
+    return operator_table[c];
 }
 
+// Fast keyword classification using length-based dispatch
+// SectorLambda-inspired: minimize comparisons by filtering on length first
 fn classifyWord(word: []const u8) TokenType {
-    // keywords
-    if (std.mem.eql(u8, word, "if")) return .If;
-    if (std.mem.eql(u8, word, "then")) return .Then;
-    if (std.mem.eql(u8, word, "else")) return .Else;
-    if (std.mem.eql(u8, word, "elif")) return .Elif;
-    if (std.mem.eql(u8, word, "fi")) return .Fi;
-    if (std.mem.eql(u8, word, "case")) return .Case;
-    if (std.mem.eql(u8, word, "esac")) return .Esac;
-    if (std.mem.eql(u8, word, "for")) return .For;
-    if (std.mem.eql(u8, word, "while")) return .While;
-    if (std.mem.eql(u8, word, "until")) return .Until;
-    if (std.mem.eql(u8, word, "do")) return .Do;
-    if (std.mem.eql(u8, word, "done")) return .Done;
-    if (std.mem.eql(u8, word, "in")) return .In;
-    if (std.mem.eql(u8, word, "function")) return .Function;
-    return .Word;
+    return switch (word.len) {
+        2 => {
+            if (word[0] == 'i') {
+                if (word[1] == 'f') return .If;
+                if (word[1] == 'n') return .In;
+            }
+            if (word[0] == 'd' and word[1] == 'o') return .Do;
+            if (word[0] == 'f' and word[1] == 'i') return .Fi;
+            return .Word;
+        },
+        3 => {
+            if (word[0] == 'f' and word[1] == 'o' and word[2] == 'r') return .For;
+            return .Word;
+        },
+        4 => {
+            // Copy to aligned buffer for fast comparison
+            var buf: [4]u8 align(4) = undefined;
+            @memcpy(&buf, word[0..4]);
+            const w = @as(*const u32, @ptrCast(&buf)).*;
+            if (w == @as(u32, @bitCast([4]u8{ 't', 'h', 'e', 'n' }))) return .Then;
+            if (w == @as(u32, @bitCast([4]u8{ 'e', 'l', 's', 'e' }))) return .Else;
+            if (w == @as(u32, @bitCast([4]u8{ 'e', 'l', 'i', 'f' }))) return .Elif;
+            if (w == @as(u32, @bitCast([4]u8{ 'c', 'a', 's', 'e' }))) return .Case;
+            if (w == @as(u32, @bitCast([4]u8{ 'e', 's', 'a', 'c' }))) return .Esac;
+            if (w == @as(u32, @bitCast([4]u8{ 'd', 'o', 'n', 'e' }))) return .Done;
+            return .Word;
+        },
+        5 => {
+            // First 4 chars comparison + check 5th
+            var buf: [4]u8 align(4) = undefined;
+            @memcpy(&buf, word[0..4]);
+            const w4 = @as(*const u32, @ptrCast(&buf)).*;
+            if (w4 == @as(u32, @bitCast([4]u8{ 'w', 'h', 'i', 'l' })) and word[4] == 'e') return .While;
+            if (w4 == @as(u32, @bitCast([4]u8{ 'u', 'n', 't', 'i' })) and word[4] == 'l') return .Until;
+            return .Word;
+        },
+        8 => {
+            // Check first char quickly, then do full comparison
+            if (word[0] == 'f') {
+                var buf: [8]u8 align(4) = undefined;
+                @memcpy(&buf, word[0..8]);
+                const w1 = @as(*const u32, @ptrCast(&buf)).*;
+                const w2 = @as(*const u32, @ptrCast(buf[4..8])).*;
+                if (w1 == @as(u32, @bitCast([4]u8{ 'f', 'u', 'n', 'c' })) and
+                    w2 == @as(u32, @bitCast([4]u8{ 't', 'i', 'o', 'n' }))) return .Function;
+            }
+            return .Word;
+        },
+        else => .Word,
+    };
 }

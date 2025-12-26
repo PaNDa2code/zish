@@ -5,6 +5,33 @@ const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
 const parser = @import("parser.zig");
 
+// Fast integer parsing for small numbers - SectorLambda-inspired
+// Optimized for the common case of small positive integers (loop counters, etc.)
+inline fn fastParseI64(s: []const u8) ?i64 {
+    if (s.len == 0 or s.len > 19) return null;
+
+    var i: usize = 0;
+    var negative = false;
+
+    if (s[0] == '-') {
+        negative = true;
+        i = 1;
+        if (s.len == 1) return null;
+    } else if (s[0] == '+') {
+        i = 1;
+        if (s.len == 1) return null;
+    }
+
+    var result: i64 = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c < '0' or c > '9') return null;
+        result = result * 10 + (c - '0');
+    }
+
+    return if (negative) -result else result;
+}
+
 // Build environment array merging system env with shell variables
 // Shell variables override system environment
 fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
@@ -335,17 +362,31 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
         arg_count += 1;
     }
 
-    // Output
-    const writer = shell.stdout();
+    // Output - batch into single buffer to minimize syscalls
+    // SectorLambda-inspired: single write() is faster than multiple
+    var out_buf: [4096]u8 = undefined;
+    var out_pos: usize = 0;
+
     for (arg_slices[0..arg_count], 0..) |arg, i| {
-        if (i > 0) try writer.writeByte(' ');
+        if (i > 0 and out_pos < out_buf.len) {
+            out_buf[out_pos] = ' ';
+            out_pos += 1;
+        }
         if (interpret_escapes) {
-            try writeEscaped(writer, arg);
+            out_pos += writeEscapedToBuf(arg, out_buf[out_pos..]);
         } else {
-            try writer.writeAll(arg);
+            const copy_len = @min(arg.len, out_buf.len - out_pos);
+            @memcpy(out_buf[out_pos..][0..copy_len], arg[0..copy_len]);
+            out_pos += copy_len;
         }
     }
-    if (print_newline) try writer.writeByte('\n');
+    if (print_newline and out_pos < out_buf.len) {
+        out_buf[out_pos] = '\n';
+        out_pos += 1;
+    }
+
+    // Single write syscall
+    try shell.stdout().writeAll(out_buf[0..out_pos]);
 
     return 0;
 }
@@ -516,15 +557,28 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             break;
         }
 
+        // Batch output into single buffer
+        var out_buf: [4096]u8 = undefined;
+        var out_pos: usize = 0;
+
         for (expanded_args.items[arg_start..], 0..) |arg, i| {
-            if (i > 0) try shell.stdout().writeByte(' ');
+            if (i > 0 and out_pos < out_buf.len) {
+                out_buf[out_pos] = ' ';
+                out_pos += 1;
+            }
             if (interpret_escapes) {
-                try writeEscaped(shell.stdout(), arg);
+                out_pos += writeEscapedToBuf(arg, out_buf[out_pos..]);
             } else {
-                try shell.stdout().writeAll(arg);
+                const copy_len = @min(arg.len, out_buf.len - out_pos);
+                @memcpy(out_buf[out_pos..][0..copy_len], arg[0..copy_len]);
+                out_pos += copy_len;
             }
         }
-        if (print_newline) try shell.stdout().writeByte('\n');
+        if (print_newline and out_pos < out_buf.len) {
+            out_buf[out_pos] = '\n';
+            out_pos += 1;
+        }
+        try shell.stdout().writeAll(out_buf[0..out_pos]);
         return 0;
     }
 
@@ -1512,6 +1566,23 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
     var last_status: u8 = 0;
     var should_break = false;
 
+    // SectorLambda-inspired: cache variable pointer to avoid repeated hash lookups
+    // Pre-allocate loop variable with generous buffer to avoid reallocation
+    var cached_value_ptr: ?*[]const u8 = null;
+    var loop_buf: [256]u8 = undefined; // stack buffer for small values
+    var heap_buf: ?[]u8 = null;
+    defer if (heap_buf) |hb| shell.allocator.free(hb);
+
+    // Ensure variable exists with preallocated buffer
+    if (shell.variables.getPtr(variable.value)) |ptr| {
+        cached_value_ptr = ptr;
+    } else {
+        // Create new variable with stack buffer backing
+        const name_copy = try shell.allocator.dupe(u8, variable.value);
+        try shell.variables.put(name_copy, loop_buf[0..0]);
+        cached_value_ptr = shell.variables.getPtr(variable.value);
+    }
+
     outer: for (values) |value_node| {
         // Fast path: if no variables or globs, use the value directly
         const raw_value = value_node.value;
@@ -1520,8 +1591,8 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
         const has_glob = glob.hasGlobChars(raw_value);
 
         if (!needs_expansion and !has_glob) {
-            // Direct iteration - no allocations needed for the value itself
-            try setForVariable(shell, variable.value, raw_value);
+            // Direct iteration - use cached pointer for zero-lookup assignment
+            setForVariableFast(cached_value_ptr.?, raw_value, &loop_buf, &heap_buf, shell.allocator);
             last_status = try evaluateAst(shell, body);
             if (last_status == 254) {
                 should_break = true;
@@ -1551,7 +1622,7 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                 glob_results;
 
             for (items) |item| {
-                try setForVariable(shell, variable.value, item);
+                setForVariableFast(cached_value_ptr.?, item, &loop_buf, &heap_buf, shell.allocator);
                 last_status = try evaluateAst(shell, body);
                 if (last_status == 254) {
                     should_break = true;
@@ -1564,7 +1635,7 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
             }
         } else {
             // No glob, just use expanded value
-            try setForVariable(shell, variable.value, var_expanded);
+            setForVariableFast(cached_value_ptr.?, var_expanded, &loop_buf, &heap_buf, shell.allocator);
             last_status = try evaluateAst(shell, body);
             if (last_status == 254) {
                 should_break = true;
@@ -1577,6 +1648,34 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     return if (should_break) 0 else last_status;
+}
+
+// Ultra-fast variable assignment using cached pointer - no hash lookup per iteration
+// SectorLambda-inspired: minimize per-iteration overhead
+inline fn setForVariableFast(
+    value_ptr: *[]const u8,
+    value: []const u8,
+    stack_buf: *[256]u8,
+    heap_buf: *?[]u8,
+    allocator: std.mem.Allocator,
+) void {
+    if (value.len <= 256) {
+        // Use stack buffer - zero allocations
+        @memcpy(stack_buf[0..value.len], value);
+        value_ptr.* = stack_buf[0..value.len];
+    } else {
+        // Need heap for large values (rare)
+        if (heap_buf.*) |hb| {
+            if (value.len <= hb.len) {
+                @memcpy(hb[0..value.len], value);
+                value_ptr.* = hb[0..value.len];
+                return;
+            }
+            allocator.free(hb);
+        }
+        heap_buf.* = allocator.dupe(u8, value) catch return;
+        value_ptr.* = heap_buf.*.?;
+    }
 }
 
 // Helper for for-loop variable assignment - reuses existing storage when possible
@@ -1779,28 +1878,28 @@ fn evaluateTestPrimary(args: []const []const u8) bool {
         } else if (std.mem.eql(u8, op, "!=")) {
             return !std.mem.eql(u8, left, right);
         } else if (std.mem.eql(u8, op, "-eq")) {
-            const l = std.fmt.parseInt(i64, left, 10) catch return false;
-            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            const l = fastParseI64(left) orelse return false;
+            const r = fastParseI64(right) orelse return false;
             return l == r;
         } else if (std.mem.eql(u8, op, "-ne")) {
-            const l = std.fmt.parseInt(i64, left, 10) catch return false;
-            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            const l = fastParseI64(left) orelse return false;
+            const r = fastParseI64(right) orelse return false;
             return l != r;
         } else if (std.mem.eql(u8, op, "-lt")) {
-            const l = std.fmt.parseInt(i64, left, 10) catch return false;
-            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            const l = fastParseI64(left) orelse return false;
+            const r = fastParseI64(right) orelse return false;
             return l < r;
         } else if (std.mem.eql(u8, op, "-gt")) {
-            const l = std.fmt.parseInt(i64, left, 10) catch return false;
-            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            const l = fastParseI64(left) orelse return false;
+            const r = fastParseI64(right) orelse return false;
             return l > r;
         } else if (std.mem.eql(u8, op, "-le")) {
-            const l = std.fmt.parseInt(i64, left, 10) catch return false;
-            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            const l = fastParseI64(left) orelse return false;
+            const r = fastParseI64(right) orelse return false;
             return l <= r;
         } else if (std.mem.eql(u8, op, "-ge")) {
-            const l = std.fmt.parseInt(i64, left, 10) catch return false;
-            const r = std.fmt.parseInt(i64, right, 10) catch return false;
+            const l = fastParseI64(left) orelse return false;
+            const r = fastParseI64(right) orelse return false;
             return l >= r;
         }
     }
@@ -2011,4 +2110,72 @@ fn writeEscaped(writer: anytype, input: []const u8) !void {
             i += 1;
         }
     }
+}
+
+// Buffer-based escape sequence writer - returns bytes written
+fn writeEscapedToBuf(input: []const u8, buf: []u8) usize {
+    var out_pos: usize = 0;
+    var i: usize = 0;
+
+    while (i < input.len and out_pos < buf.len) {
+        if (input[i] == '\\' and i + 1 < input.len) {
+            const next = input[i + 1];
+            const c: u8 = switch (next) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                'a' => 0x07,
+                'b' => 0x08,
+                'e' => 0x1b,
+                'f' => 0x0c,
+                'v' => 0x0b,
+                '0' => blk: {
+                    // octal escape
+                    var val: u8 = 0;
+                    var j: usize = i + 2;
+                    var digits: usize = 0;
+                    while (j < input.len and digits < 3) {
+                        const ch = input[j];
+                        if (ch >= '0' and ch <= '7') {
+                            val = val * 8 + (ch - '0');
+                            j += 1;
+                            digits += 1;
+                        } else break;
+                    }
+                    i = j;
+                    break :blk val;
+                },
+                'x' => blk: {
+                    // hex escape
+                    if (i + 3 < input.len) {
+                        const hex = input[i + 2 .. i + 4];
+                        if (std.fmt.parseInt(u8, hex, 16)) |val| {
+                            i += 4;
+                            break :blk val;
+                        } else |_| {}
+                    }
+                    buf[out_pos] = input[i];
+                    out_pos += 1;
+                    i += 1;
+                    continue;
+                },
+                else => {
+                    buf[out_pos] = input[i];
+                    out_pos += 1;
+                    i += 1;
+                    continue;
+                },
+            };
+            buf[out_pos] = c;
+            out_pos += 1;
+            if (next != '0' and next != 'x') i += 2;
+        } else {
+            buf[out_pos] = input[i];
+            out_pos += 1;
+            i += 1;
+        }
+    }
+
+    return out_pos;
 }

@@ -1622,18 +1622,30 @@ pub const ExpandResult = struct {
 };
 
 /// Expand variables without allocation when possible
+// Expansion character lookup table - SectorLambda-inspired
+const expansion_char_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    table['$'] = true;
+    table['`'] = true;
+    break :blk table;
+};
+
 pub fn expandVariablesZ(self: *Shell, input: []const u8) !ExpandResult {
     // Fast path: if no special chars, return slice directly (no alloc!)
-    const needs_expansion = blk: {
-        if (input.len > 0 and input[0] == '~') break :blk true;
+    if (input.len > 0 and input[0] == '~') {
+        // Tilde needs expansion
+    } else {
+        // Single pass check using lookup table
+        var needs_expansion = false;
         for (input) |c| {
-            if (c == '$' or c == '`') break :blk true;
+            if (expansion_char_table[c]) {
+                needs_expansion = true;
+                break;
+            }
         }
-        break :blk false;
-    };
-
-    if (!needs_expansion) {
-        return .{ .slice = input, .owned = false };
+        if (!needs_expansion) {
+            return .{ .slice = input, .owned = false };
+        }
     }
 
     // Need expansion - allocate
@@ -1643,16 +1655,18 @@ pub fn expandVariablesZ(self: *Shell, input: []const u8) !ExpandResult {
 
 pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
     // Legacy API - always returns owned slice for compatibility
-    const needs_expansion = blk: {
-        if (input.len > 0 and input[0] == '~') break :blk true;
+    // Use lookup table for fast check
+    if (input.len == 0 or input[0] != '~') {
+        var needs_expansion = false;
         for (input) |c| {
-            if (c == '$' or c == '`') break :blk true;
+            if (expansion_char_table[c]) {
+                needs_expansion = true;
+                break;
+            }
         }
-        break :blk false;
-    };
-
-    if (!needs_expansion) {
-        return try self.allocator.dupe(u8, input);
+        if (!needs_expansion) {
+            return try self.allocator.dupe(u8, input);
+        }
     }
 
     return self.expandVariablesAlloc(input);
@@ -1935,15 +1949,21 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 }
 
 pub fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
-    var trimmed = std.mem.trim(u8, expr, " \t\n\r");
+    const trimmed = std.mem.trim(u8, expr, " \t\n\r");
     if (trimmed.len == 0) return 0;
 
-    // check for operators (left-to-right, lowest to highest precedence)
-    for ([_]u8{'+', '-', '*', '/'}) |op| {
+    // SectorLambda-inspired: fast path for common simple expressions
+    // Pattern: "var + num", "num + var", "var + var", "num OP num"
+    if (tryFastArithmetic(trimmed, self)) |result| {
+        return result;
+    }
+
+    // Slow path: recursive evaluation for complex expressions
+    for ([_]u8{ '+', '-', '*', '/' }) |op| {
         if (std.mem.lastIndexOfScalar(u8, trimmed, op)) |op_pos| {
             if (op_pos > 0 and op_pos < trimmed.len - 1) {
                 const left = try self.evaluateArithmetic(trimmed[0..op_pos]);
-                const right = try self.evaluateArithmetic(trimmed[op_pos+1..]);
+                const right = try self.evaluateArithmetic(trimmed[op_pos + 1 ..]);
                 return switch (op) {
                     '+' => left + right,
                     '-' => left - right,
@@ -1966,6 +1986,54 @@ pub fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
         // unknown variable defaults to 0
         return 0;
     }
+}
+
+// Fast path for simple binary expressions - avoids recursion overhead
+// Handles: "a + b", "1 + 2", "i + 1", etc.
+fn tryFastArithmetic(expr: []const u8, shell: *Shell) ?i64 {
+    // Find operator (only handle single operator case)
+    var op_pos: ?usize = null;
+    var op_char: u8 = 0;
+    var op_count: usize = 0;
+
+    for (expr, 0..) |c, i| {
+        if (c == '+' or c == '-' or c == '*' or c == '/') {
+            if (i > 0 and i < expr.len - 1) {
+                op_count += 1;
+                if (op_count > 1) return null; // Multiple operators - use slow path
+                op_pos = i;
+                op_char = c;
+            }
+        }
+    }
+
+    const pos = op_pos orelse return null;
+
+    // Parse left operand
+    const left_str = std.mem.trim(u8, expr[0..pos], " \t");
+    const left = if (std.fmt.parseInt(i64, left_str, 10)) |n|
+        n
+    else |_| blk: {
+        const val = shell.variables.get(left_str) orelse return null;
+        break :blk std.fmt.parseInt(i64, val, 10) catch return null;
+    };
+
+    // Parse right operand
+    const right_str = std.mem.trim(u8, expr[pos + 1 ..], " \t");
+    const right = if (std.fmt.parseInt(i64, right_str, 10)) |n|
+        n
+    else |_| blk: {
+        const val = shell.variables.get(right_str) orelse return null;
+        break :blk std.fmt.parseInt(i64, val, 10) catch return null;
+    };
+
+    return switch (op_char) {
+        '+' => left + right,
+        '-' => left - right,
+        '*' => left * right,
+        '/' => if (right != 0) @divTrunc(left, right) else 0,
+        else => null,
+    };
 }
 
 fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
